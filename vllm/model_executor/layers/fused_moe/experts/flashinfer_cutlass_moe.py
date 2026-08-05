@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -96,6 +99,35 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         # - skip input activation quantization (kernel applies scaling)
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
         self.max_capture_size = moe_config.max_capture_size
+        parallel = moe_config.moe_parallel_config
+        raw_tune_max_num_tokens = os.environ.get(
+            "AUTORESEARCH_FLASHINFER_MOE_TUNE_MAX_NUM_TOKENS"
+        )
+        if (
+            raw_tune_max_num_tokens is None
+            or not raw_tune_max_num_tokens.isascii()
+            or not raw_tune_max_num_tokens.isdecimal()
+            or raw_tune_max_num_tokens.startswith("0")
+        ):
+            raise RuntimeError(
+                "AUTORESEARCH_FLASHINFER_MOE_TUNE_MAX_NUM_TOKENS must be a "
+                "canonical positive decimal"
+            )
+        self.tune_max_num_tokens = int(raw_tune_max_num_tokens)
+        expected_tune_max_num_tokens = self.max_capture_size * parallel.dp_size
+        if (
+            self.tune_max_num_tokens != expected_tune_max_num_tokens
+            or parallel.tp_size != 1
+            or parallel.dp_size != 4
+            or parallel.ep_size != 4
+            or not parallel.use_ep
+            or not parallel.use_ag_rs_all2all_kernels
+        ):
+            raise RuntimeError(
+                "FlashInfer MoE tuning ceiling/topology mismatch: "
+                f"configured={self.tune_max_num_tokens} "
+                f"expected={expected_tune_max_num_tokens} parallel={parallel}"
+            )
         self.gemm1_clamp_limit: torch.Tensor | None = None
         self.gemm1_alpha: torch.Tensor | None = None
         self.gemm1_beta: torch.Tensor | None = None
@@ -460,7 +492,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
             use_fused_finalize=False,
-            tune_max_num_tokens=max(self.max_capture_size, 1),
+            tune_max_num_tokens=self.tune_max_num_tokens,
         )
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
