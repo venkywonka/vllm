@@ -4,6 +4,7 @@
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
@@ -30,6 +31,7 @@ from vllm.utils.flashinfer import (
 )
 
 logger = init_logger(__name__)
+_AUTORESEARCH_NVFP4_W4A4_FLASHINFER_CUTLASS_MARKER_EMITTED = False
 
 
 def is_valid_flashinfer_cutlass_fused_moe(
@@ -95,9 +97,43 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         self.use_deepseek_fp8_block_scale = quant_config.is_block_quantized
         self.max_capture_size = moe_config.max_capture_size
         self.gemm1_clamp_limit: torch.Tensor | None = None
-        if quant_config.gemm1_clamp_limit is not None:
-            self.gemm1_clamp_limit = torch.tensor(
-                [quant_config.gemm1_clamp_limit] * self.num_experts,
+        self.gemm1_alpha: torch.Tensor | None = None
+        self.gemm1_beta: torch.Tensor | None = None
+        self._gemm1_clamp_limit_value: float | None = None
+        self._gemm1_alpha_value: float | None = None
+        self._gemm1_beta_value: float | None = None
+
+        if quant_config.use_nvfp4_w4a4:
+            clamp_limit = quant_config.gemm1_clamp_limit
+            if clamp_limit is None:
+                clamp_limit = moe_config.swiglu_limit
+            alpha = quant_config.gemm1_alpha
+            if alpha is None:
+                alpha = moe_config.swiglu_alpha
+            beta = quant_config.gemm1_beta
+            if beta is None:
+                beta = moe_config.swiglu_beta
+
+            def _per_expert(value: float | None) -> torch.Tensor | None:
+                if value is None:
+                    return None
+                return torch.full(
+                    (self.num_experts,),
+                    float(value),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
+            self.gemm1_clamp_limit = _per_expert(clamp_limit)
+            self.gemm1_alpha = _per_expert(alpha)
+            self.gemm1_beta = _per_expert(beta)
+            self._gemm1_clamp_limit_value = clamp_limit
+            self._gemm1_alpha_value = alpha
+            self._gemm1_beta_value = beta
+        elif quant_config.gemm1_clamp_limit is not None:
+            self.gemm1_clamp_limit = torch.full(
+                (self.num_experts,),
+                float(quant_config.gemm1_clamp_limit),
                 dtype=torch.float32,
                 device=self.device,
             )
@@ -191,6 +227,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             MoEActivation.GELU_TANH,
             MoEActivation.RELU2_NO_MUL,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
         ]
 
     @staticmethod
@@ -270,6 +307,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             MoEActivation.SILU: ActivationType.Swiglu,  # This is the default
             MoEActivation.GELU_TANH: ActivationType.Geglu,
             MoEActivation.SWIGLUOAI: ActivationType.Swiglu,  # gpt-oss alias
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE: ActivationType.Swiglu,
             MoEActivation.RELU2_NO_MUL: ActivationType.Relu2,
         }
         assert activation in activation_str_to_value_map, (
@@ -286,6 +324,29 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
         swiglu_limit = (
             self.gemm1_clamp_limit if activation == MoEActivation.SILU else None
         )
+        if activation == MoEActivation.SWIGLUOAI_UNINTERLEAVE:
+            assert self.quant_config.use_nvfp4_w4a4
+            assert self.gemm1_clamp_limit is not None
+            assert self.gemm1_alpha is not None
+            assert self.gemm1_beta is not None
+            swiglu_alpha = self.gemm1_alpha
+            swiglu_beta = self.gemm1_beta
+            swiglu_limit = self.gemm1_clamp_limit
+
+            global _AUTORESEARCH_NVFP4_W4A4_FLASHINFER_CUTLASS_MARKER_EMITTED
+            if not _AUTORESEARCH_NVFP4_W4A4_FLASHINFER_CUTLASS_MARKER_EMITTED:
+                logger.info(
+                    "AUTORESEARCH_NVFP4_W4A4_FLASHINFER_CUTLASS "
+                    "tp_rank=%d activation=%s clamp_limit=%s alpha=%s beta=%s "
+                    "input_quant=nvfp4_dynamic weight_quant=nvfp4_static "
+                    "weight_layout=flashinfer_w3w1 output_finalize=fused",
+                    get_tensor_model_parallel_rank(),
+                    activation.value,
+                    self._gemm1_clamp_limit_value,
+                    self._gemm1_alpha_value,
+                    self._gemm1_beta_value,
+                )
+                _AUTORESEARCH_NVFP4_W4A4_FLASHINFER_CUTLASS_MARKER_EMITTED = True
         use_mxfp8_act_scaling = False
         use_w4_group_scaling = False
         # Select quantization metadata based on FP8 format/path
