@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
@@ -11,6 +14,9 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
 )
 from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
+
+
+_AUTORESEARCH_PACKED_NVFP4_PRE_AG_PROOF_EMITTED = False
 
 
 def _quantize_and_setup_dispatch(
@@ -122,6 +128,8 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
     ) -> mk.PrepareResultType:
         """Quantize and Dispatch Topk Weights and Topk Ids."""
 
+        global _AUTORESEARCH_PACKED_NVFP4_PRE_AG_PROOF_EMITTED
+
         if apply_router_weight_on_input:
             topk = topk_ids.size(1)
             assert topk == 1, (
@@ -132,6 +140,40 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         a1q, scales, a1q_scale_orig = _quantize_and_setup_dispatch(
             a1, quant_config, defer_input_quant
         )
+
+        if (
+            os.environ.get("AUTORESEARCH_PACKED_NVFP4_PRE_AG_PROOF") == "1"
+            and not _AUTORESEARCH_PACKED_NVFP4_PRE_AG_PROOF_EMITTED
+        ):
+            assert quant_config.use_nvfp4_w4a4
+            assert quant_config.quant_dtype == "nvfp4"
+            assert quant_config.is_scale_swizzled
+            assert not defer_input_quant
+            assert a1.dtype in (torch.bfloat16, torch.float16)
+            assert a1q.dtype == torch.uint8
+            assert scales is not None and len(scales) == 1
+            assert a1q_scale_orig is scales[0]
+            assert a1q_scale_orig.element_size() == 1
+            record = {
+                "activation_dtype_before_quant": str(a1.dtype),
+                "activation_shape_before_quant": list(a1.shape),
+                "dispatch_primitive": "get_ep_group().dispatch",
+                "input_quant": "nvfp4_dynamic",
+                "packed_activation_dtype_before_dispatch": str(a1q.dtype),
+                "packed_activation_shape_before_dispatch": list(a1q.shape),
+                "scale_dtype_before_dispatch": str(a1q_scale_orig.dtype),
+                "scale_shape_before_dispatch": list(a1q_scale_orig.shape),
+                "scale_swizzled_before_dispatch": False,
+                "scale_swizzle_stage": "after_dispatch_before_moe",
+                "schema_version": 1,
+                "weight_quant": "nvfp4_static",
+            }
+            print(
+                "AUTORESEARCH_PACKED_NVFP4_PRE_AG_PROOF_JSON="
+                + json.dumps(record, sort_keys=True, separators=(",", ":")),
+                flush=True,
+            )
+            _AUTORESEARCH_PACKED_NVFP4_PRE_AG_PROOF_EMITTED = True
 
         # When LoRA is active, dispatch the per-token LoRA id along with
         # hidden_states so every rank receives the correct mapping for the
