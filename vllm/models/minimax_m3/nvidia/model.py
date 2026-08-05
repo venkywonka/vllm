@@ -1072,6 +1072,10 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Return the global greedy token without gathering full TP logits."""
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
@@ -1273,6 +1277,10 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Delegate target-local argmax to the nested text model."""
+        return self.language_model.get_top_tokens(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()

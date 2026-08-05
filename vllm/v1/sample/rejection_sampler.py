@@ -196,6 +196,48 @@ class RejectionSampler(nn.Module):
             logprobs_tensors=logprobs_tensors,
         )
 
+    def forward_from_target_argmax(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_argmax_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        """Run exact all-greedy rejection from flat target argmax token IDs.
+
+        ``target_argmax_ids`` follows ``metadata.logits_indices`` ordering and
+        therefore contains both draft-validation rows and one bonus row per
+        request. The caller must fail closed before this method when any
+        operation can change an argmax or requires full logits.
+        """
+        if not sampling_metadata.all_greedy or self.synthetic_mode:
+            raise ValueError(
+                "target local argmax requires deterministic greedy rejection"
+            )
+        if sampling_metadata.max_num_logprobs is not None:
+            raise ValueError("target local argmax cannot produce output logprobs")
+        if target_argmax_ids.ndim != 1:
+            raise ValueError("target_argmax_ids must be a flat tensor")
+        assert metadata.max_spec_len <= MAX_SPEC_LEN
+
+        target_argmax = target_argmax_ids[
+            metadata.target_logits_indices
+        ].contiguous()
+        bonus_token_ids = target_argmax_ids[
+            metadata.bonus_logits_indices
+        ].reshape(-1, 1).contiguous()
+        output_token_ids = rejection_sample_from_target_argmax(
+            metadata.draft_token_ids,
+            metadata.num_draft_tokens,
+            metadata.max_spec_len,
+            metadata.cu_num_draft_tokens,
+            target_argmax,
+            bonus_token_ids,
+        )
+        return SamplerOutput(
+            sampled_token_ids=output_token_ids,
+            logprobs_tensors=None,
+        )
+
     def _get_logprobs_tensors(
         self,
         max_num_logprobs: int,
@@ -503,6 +545,51 @@ def rejection_sample(
         synthetic_conditional_rates,
         NO_DRAFT_PROBS=draft_probs is None,
         SYNTHETIC_MODE=synthetic_mode,
+    )
+    return output_token_ids
+
+
+def rejection_sample_from_target_argmax(
+    # [num_tokens]
+    draft_token_ids: torch.Tensor,
+    # [batch_size]
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    # [batch_size]
+    cu_num_draft_tokens: torch.Tensor,
+    # [num_tokens]
+    target_argmax: torch.Tensor,
+    # [batch_size, 1]
+    bonus_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministic greedy rejection without materializing target logits."""
+    if target_argmax.ndim != 1:
+        raise ValueError("target_argmax must be a flat tensor")
+    if target_argmax.shape != draft_token_ids.shape:
+        raise ValueError("target argmax and draft token shapes must match")
+    batch_size = len(num_draft_tokens)
+    if bonus_token_ids.shape != (batch_size, 1):
+        raise ValueError("bonus_token_ids must have shape [batch_size, 1]")
+    if cu_num_draft_tokens.shape != (batch_size,):
+        raise ValueError("cu_num_draft_tokens must have shape [batch_size]")
+
+    output_token_ids = torch.full(
+        (batch_size, max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=target_argmax.device,
+    )
+    rejection_greedy_sample_kernel[(batch_size,)](
+        output_token_ids,
+        cu_num_draft_tokens,
+        draft_token_ids,
+        target_argmax,
+        bonus_token_ids,
+        None,
+        max_spec_len,
+        None,
+        None,
+        SYNTHETIC_MODE=False,
     )
     return output_token_ids
 

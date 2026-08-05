@@ -171,6 +171,7 @@ from vllm.v1.outputs import (
 )
 from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+from vllm.v1.sample.logits_processor.builtin import MinTokensLogitsProcessor
 from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
@@ -234,6 +235,55 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+_TARGET_LOCAL_ARGMAX_MARKER = (
+    "Using TP-local argmax reduction for target token selection "
+    "(no full-vocabulary all-gather)."
+)
+
+
+def _target_local_argmax_eligible(
+    *,
+    enabled: bool,
+    has_spec_decode: bool,
+    all_greedy: bool,
+    has_output_logprobs: bool,
+    has_logprob_token_ids: bool,
+    has_penalties: bool,
+    has_allowed_token_ids: bool,
+    has_bad_words: bool,
+    has_non_argmax_invariant_processor: bool,
+    has_thinking_budget: bool,
+    compute_nans_in_logits: bool,
+    pp_world_size: int,
+    broadcast_pp_output: bool,
+    draft_sampling_is_greedy: bool,
+    rejection_sampling_is_standard: bool,
+    has_draft_probs: bool,
+    model_supports_local_argmax: bool,
+    has_lora: bool,
+) -> bool:
+    """Pure fail-closed predicate for the candidate target fast path."""
+    return (
+        enabled
+        and has_spec_decode
+        and all_greedy
+        and not has_output_logprobs
+        and not has_logprob_token_ids
+        and not has_penalties
+        and not has_allowed_token_ids
+        and not has_bad_words
+        and not has_non_argmax_invariant_processor
+        and not has_thinking_budget
+        and not compute_nans_in_logits
+        and pp_world_size == 1
+        and not broadcast_pp_output
+        and draft_sampling_is_greedy
+        and rejection_sampling_is_standard
+        and not has_draft_probs
+        and model_supports_local_argmax
+        and not has_lora
+    )
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -405,7 +455,8 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
+    target_argmax_ids: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -3568,10 +3619,73 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    @staticmethod
+    def _has_active_non_argmax_invariant_processor(
+        sampling_metadata: SamplingMetadata,
+    ) -> bool:
+        for processor in sampling_metadata.logitsprocs.non_argmax_invariant:
+            # Spec decode always installs this processor, but it is a no-op
+            # when no live request has an outstanding min_tokens constraint.
+            if isinstance(processor, MinTokensLogitsProcessor):
+                if processor.min_toks:
+                    return True
+                continue
+            # Unknown non-invariant processors fail closed even if they appear
+            # inactive; the pinned interface has no generic activity query.
+            return True
+        return False
+
+    def _can_use_target_local_argmax(
+        self,
+        spec_decode_metadata: SpecDecodeMetadata | None,
+    ) -> bool:
+        sampling_metadata = self.input_batch.sampling_metadata
+        holder = sampling_metadata.thinking_budget_state_holder
+        spec_config = self.speculative_config
+        return _target_local_argmax_eligible(
+            enabled=envs.VLLM_TARGET_LOCAL_ARGMAX_REDUCTION,
+            has_spec_decode=spec_decode_metadata is not None,
+            all_greedy=sampling_metadata.all_greedy,
+            has_output_logprobs=sampling_metadata.max_num_logprobs is not None,
+            has_logprob_token_ids=bool(sampling_metadata.logprob_token_ids),
+            has_penalties=not sampling_metadata.no_penalties,
+            has_allowed_token_ids=(
+                sampling_metadata.allowed_token_ids_mask is not None
+            ),
+            has_bad_words=bool(sampling_metadata.bad_words_token_ids),
+            has_non_argmax_invariant_processor=(
+                self._has_active_non_argmax_invariant_processor(sampling_metadata)
+            ),
+            has_thinking_budget=(
+                holder is not None and holder.has_tracked_requests()
+            ),
+            compute_nans_in_logits=envs.VLLM_COMPUTE_NANS_IN_LOGITS,
+            pp_world_size=self.parallel_config.pipeline_parallel_size,
+            broadcast_pp_output=self.broadcast_pp_output,
+            draft_sampling_is_greedy=(
+                spec_config is not None
+                and spec_config.draft_sample_method == "greedy"
+            ),
+            rejection_sampling_is_standard=(
+                spec_config is not None
+                and spec_config.rejection_sample_method == "standard"
+            ),
+            has_draft_probs=self._draft_probs is not None,
+            model_supports_local_argmax=hasattr(self.model, "get_top_tokens"),
+            has_lora=self.lora_config is not None,
+        )
+
+    def _log_target_local_argmax_once(self) -> None:
+        if getattr(self, "_target_local_argmax_marker_logged", False):
+            return
+        logger.info(_TARGET_LOCAL_ARGMAX_MARKER)
+        self._target_local_argmax_marker_logged = True
+
     def _sample(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        target_argmax_ids: torch.Tensor | None = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
@@ -3591,6 +3705,19 @@ class GPUModelRunner(
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+        if target_argmax_ids is not None:
+            if logits is not None or draft_probs is not None:
+                raise RuntimeError(
+                    "target local argmax state violated fail-closed assumptions"
+                )
+            sampler_output = self.rejection_sampler.forward_from_target_argmax(
+                spec_decode_metadata,
+                target_argmax_ids,
+                sampling_metadata,
+            )
+            self._log_target_local_argmax_once()
+            return sampler_output
+        assert logits is not None
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             draft_probs,
@@ -4327,6 +4454,7 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+            target_argmax_ids: torch.Tensor | None = None
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4353,7 +4481,13 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if self._can_use_target_local_argmax(spec_decode_metadata):
+                    target_argmax_ids = cast(Any, self.model).get_top_tokens(
+                        sample_hidden_states
+                    )
+                    logits = None
+                else:
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4387,6 +4521,7 @@ class GPUModelRunner(
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
+            target_argmax_ids,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4438,6 +4573,7 @@ class GPUModelRunner(
         (
             scheduler_output,
             logits,
+            target_argmax_ids,
             spec_decode_metadata,
             spec_decode_common_attn_metadata,
             hidden_states,
@@ -4450,14 +4586,25 @@ class GPUModelRunner(
         # Clear ephemeral state.
         self.execute_model_state = None
 
+        # Grammar state arrives after execute_model(). Re-materialize full
+        # logits only for this late semantic constraint and abandon the
+        # candidate fast path for the step.
+        if target_argmax_ids is not None and grammar_output is not None:
+            assert logits is None
+            logits = self.model.compute_logits(sample_hidden_states)
+            target_argmax_ids = None
+
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
+            assert logits is not None
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits, spec_decode_metadata, target_argmax_ids
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
