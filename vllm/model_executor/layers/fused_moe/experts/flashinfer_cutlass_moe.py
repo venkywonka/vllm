@@ -35,6 +35,7 @@ from vllm.utils.flashinfer import (
 
 logger = init_logger(__name__)
 _AUTORESEARCH_NVFP4_W4A4_FLASHINFER_CUTLASS_MARKER_EMITTED = False
+_AUTORESEARCH_FLASHINFER_MOE_MNT_CALL_PROOF_EMITTED = False
 
 
 def is_valid_flashinfer_cutlass_fused_moe(
@@ -371,7 +372,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
                     "AUTORESEARCH_NVFP4_W4A4_FLASHINFER_CUTLASS "
                     "tp_rank=%d activation=%s clamp_limit=%s alpha=%s beta=%s "
                     "input_quant=nvfp4_dynamic weight_quant=nvfp4_static "
-                    "weight_layout=flashinfer_w3w1 output_finalize=fused",
+                    "weight_layout=flashinfer_w3w1 output_finalize=unfused",
                     get_tensor_model_parallel_rank(),
                     activation.value,
                     self._gemm1_clamp_limit_value,
@@ -494,6 +495,31 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_fused_finalize=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
         )
+
+        input_dim0 = int(hidden_states.shape[0])
+        global _AUTORESEARCH_FLASHINFER_MOE_MNT_CALL_PROOF_EMITTED
+        if (
+            input_dim0 == self.tune_max_num_tokens
+            and not _AUTORESEARCH_FLASHINFER_MOE_MNT_CALL_PROOF_EMITTED
+        ):
+            record = {
+                "ep_rank": self.ep_rank,
+                "ep_size": self.ep_size,
+                "input_dim0": input_dim0,
+                "max_capture_size": self.max_capture_size,
+                "schema_version": 2,
+                "status": "flashinfer_python_binding_returned",
+                "tp_rank": self.tp_rank,
+                "tp_size": self.tp_size,
+                "tune_max_num_tokens": self.tune_max_num_tokens,
+                "use_fused_finalize": False,
+                "use_w4_group_scaling": use_w4_group_scaling,
+            }
+            logger.info(
+                "AUTORESEARCH_FLASHINFER_MOE_MNT_CALL_PROOF_JSON=%s",
+                json.dumps(record, sort_keys=True, separators=(",", ":")),
+            )
+            _AUTORESEARCH_FLASHINFER_MOE_MNT_CALL_PROOF_EMITTED = True
 
     def moe_sum(self, input: torch.Tensor, output: torch.Tensor) -> None:
         # No support for LoRA in flashinfer_cutlass_fused_moe.
