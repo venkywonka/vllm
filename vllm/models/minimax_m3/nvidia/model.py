@@ -21,7 +21,10 @@ from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
@@ -64,6 +67,7 @@ from vllm.model_executor.models.utils import (
     is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 from vllm.model_executor.models.vision import run_dp_sharded_mrope_vision_model
 from vllm.models.minimax_m3.common.indexer import MiniMaxM3Indexer
@@ -146,6 +150,7 @@ class MiniMaxM3MLP(nn.Module):
         intermediate_size: int,
         quant_config: QuantizationConfig | None = None,
         reduce_results: bool = True,
+        is_sequence_parallel: bool = False,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -154,6 +159,7 @@ class MiniMaxM3MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
             quant_config=quant_config,
+            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -162,6 +168,7 @@ class MiniMaxM3MLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
         if config.hidden_act != "swigluoai":
@@ -194,9 +201,11 @@ class MiniMaxM3MoE(nn.Module):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         reduce_results: bool = True,
+        is_sequence_parallel: bool = False,
     ) -> None:
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self.is_sequence_parallel = is_sequence_parallel
         if self.tp_size > config.num_local_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
@@ -236,6 +245,7 @@ class MiniMaxM3MoE(nn.Module):
                 intermediate_size=config.intermediate_size * self.n_shared_experts,
                 quant_config=quant_config,
                 reduce_results=False,
+                is_sequence_parallel=is_sequence_parallel,
                 prefix=f"{prefix}.shared_experts",
             )
 
@@ -261,6 +271,7 @@ class MiniMaxM3MoE(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
             reduce_results=reduce_results,
+            is_sequence_parallel=is_sequence_parallel,
         )
 
     @staticmethod
@@ -269,8 +280,15 @@ class MiniMaxM3MoE(nn.Module):
         param.data.copy_(loaded_weight.to(torch.float32))
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+        if hidden_states.dim() not in {1, 2}:
+            raise ValueError("MiniMaxM3MoE only supports 1D or 2D inputs")
+        original_shape = hidden_states.shape
+        hidden_dim = original_shape[-1]
+        num_tokens = 1 if hidden_states.dim() == 1 else original_shape[0]
+        hidden_states = hidden_states.reshape(num_tokens, hidden_dim)
+
+        if self.is_sequence_parallel:
+            hidden_states = sequence_parallel_chunk(hidden_states)
 
         # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
         router_logits, _ = self.gate(hidden_states)
@@ -278,7 +296,13 @@ class MiniMaxM3MoE(nn.Module):
             hidden_states=hidden_states, router_logits=router_logits
         )
 
-        return final_hidden_states.view(num_tokens, hidden_dim)
+        if self.is_sequence_parallel:
+            final_hidden_states = tensor_model_parallel_all_gather(
+                final_hidden_states, 0
+            )
+            final_hidden_states = final_hidden_states[:num_tokens]
+
+        return final_hidden_states.reshape(original_shape)
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -657,13 +681,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
         layer_id = int(prefix.split(sep=".")[-1])
         self.layer_id = layer_id
 
-        # Complete the preceding FFN's deferred all-reduce (its down_proj / MoE
-        # combine ran with reduce_results=False), fused into this layer's
-        # input_layernorm. Both dense and MoE FFNs defer under PP==1, so every
-        # non-first layer fuses; disable when PP>1 (FFNs reduce themselves).
-        self.fuse_input_allreduce = (
-            layer_id > 0 and vllm_config.parallel_config.pipeline_parallel_size == 1
-        )
+        # Configured by MiniMaxM3Model from the preceding FFN's actual output
+        # state. SP-MoE reconstructs a complete output and must not be reduced.
+        self.fuse_input_allreduce = False
 
         is_sparse_attention_layer = (
             force_sparse_attn or layer_id in _sparse_attention_layer_ids(config)
@@ -689,6 +709,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         # Dense layers store the FFN under `mlp`; MoE layers under
         # `block_sparse_moe` -- matching the checkpoint's naming.
+        use_sequence_parallel_moe = (
+            vllm_config.parallel_config.use_sequence_parallel_moe
+        )
         self.is_moe_layer = force_moe or _is_moe_layer(config, layer_id)
         if self.is_moe_layer:
             self.block_sparse_moe = MiniMaxM3MoE(
@@ -701,7 +724,9 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 reduce_results=(
                     vllm_config.parallel_config.pipeline_parallel_size > 1
                     or is_mtp_block
+                    or use_sequence_parallel_moe
                 ),
+                is_sequence_parallel=use_sequence_parallel_moe,
             )
         else:
             self.mlp = MiniMaxM3MLP(
@@ -747,6 +772,14 @@ class MiniMaxM3DecoderLayer(nn.Module):
         ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
         hidden_states = ffn(hidden_states)
         return hidden_states, residual
+
+    @property
+    def ffn_all_reduce_deferred(self) -> bool:
+        """Whether this FFN still needs a TP all-reduce before residual add."""
+        if self.is_moe_layer:
+            moe = self.block_sparse_moe
+            return not moe.is_sequence_parallel and not moe.experts.reduce_results
+        return not self.mlp.down_proj.reduce_results
 
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
@@ -799,11 +832,13 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # The final decoder layer has no next layer, so its deferred all-reduce is
-        # completed here in the model norm.
-        self.fuse_final_allreduce = (
-            vllm_config.parallel_config.pipeline_parallel_size == 1
-        )
+        # Fuse only reductions actually deferred by the preceding FFN. An SP-MoE
+        # output has already been combined and gathered back across TP ranks.
+        previous_ffn_defers = False
+        for index, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+            layer.fuse_input_allreduce = index > 0 and previous_ffn_defers
+            previous_ffn_defers = layer.ffn_all_reduce_deferred
+        self.fuse_final_allreduce = previous_ffn_defers
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
