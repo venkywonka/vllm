@@ -2,9 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
+import os
+
 import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+from vllm.distributed import (
+    get_dp_group,
+    get_ep_group,
+    get_tp_group,
+    get_world_group,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoeWeightScaleSupported,
@@ -32,6 +41,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
 logger = init_logger(__name__)
+_AUTORESEARCH_SP_RESIDENCY_PROOF_EMITTED = False
 
 
 class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
@@ -239,6 +249,110 @@ class CompressedTensorsW4A4Nvfp4MoEMethod(CompressedTensorsMoEMethod):
             routing_tables=layer._expert_routing_tables(),
         )
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+
+        global _AUTORESEARCH_SP_RESIDENCY_PROOF_EMITTED
+        if (
+            os.environ.get("AUTORESEARCH_SP_RESIDENCY_PROOF") == "1"
+            and not _AUTORESEARCH_SP_RESIDENCY_PROOF_EMITTED
+        ):
+            parallel = self.moe.moe_parallel_config
+            world = get_world_group()
+            tp_group = get_tp_group()
+            dp_group = get_dp_group()
+            ep_group = get_ep_group()
+            prepare_finalize = self.moe_kernel.prepare_finalize
+
+            if hasattr(layer, "expert_local_to_global"):
+                local_expert_ids = [
+                    int(value)
+                    for value in layer.expert_local_to_global.detach()
+                    .cpu()
+                    .tolist()
+                    if int(value) >= 0
+                ]
+            else:
+                local_expert_ids = list(range(int(layer.global_num_experts)))
+
+            tensors = (
+                layer.w13_weight,
+                layer.w13_weight_scale,
+                layer.w13_weight_scale_2,
+                layer.w13_input_scale,
+                layer.w2_weight,
+                layer.w2_weight_scale,
+                layer.w2_weight_scale_2,
+                layer.w2_input_scale,
+            )
+            storage_bytes = 0
+            storage_pointers: list[int] = []
+            seen_storages: set[tuple[int, int]] = set()
+            for tensor in tensors:
+                storage = tensor.untyped_storage()
+                storage_key = (storage.data_ptr(), storage.nbytes())
+                if storage_key not in seen_storages:
+                    seen_storages.add(storage_key)
+                    storage_pointers.append(storage.data_ptr())
+                    storage_bytes += storage.nbytes()
+
+            record = {
+                "activation": layer.activation.value,
+                "all2all_backend": parallel.all2all_backend,
+                "cuda_device_index": torch.cuda.current_device(),
+                "dp_group_ranks": list(dp_group.ranks),
+                "dp_rank": dp_group.rank_in_group,
+                "dp_size": dp_group.world_size,
+                "effective_ep_group_ranks": (
+                    list(ep_group.ranks) if parallel.use_ep else [world.rank]
+                ),
+                "effective_ep_rank": parallel.ep_rank,
+                "effective_ep_size": parallel.ep_size,
+                "effective_moe_tp_rank": parallel.tp_rank,
+                "effective_moe_tp_size": parallel.tp_size,
+                "enable_expert_parallel": parallel.use_ep,
+                "expert_implementation_class": (
+                    self.moe_kernel.fused_experts.__class__.__name__
+                ),
+                "global_expert_count": int(layer.global_num_experts),
+                "global_rank": world.rank,
+                "input_quant": "nvfp4_dynamic",
+                "instrumentation_patch_sha256": os.environ.get(
+                    "AUTORESEARCH_SP_INSTRUMENTATION_PATCH_SHA256"
+                ),
+                "local_expert_ids": local_expert_ids,
+                "moe_backend_cli": "flashinfer_cutlass",
+                "prepare_finalize_class": prepare_finalize.__class__.__name__,
+                "prepare_finalize_is_sequence_parallel": bool(
+                    getattr(prepare_finalize, "is_sequence_parallel", False)
+                ),
+                "routed_expert_parameter_bytes": storage_bytes,
+                "routed_expert_storage_pointers": storage_pointers,
+                "schema_version": 1,
+                "sequence_parallel_enabled": parallel.is_sequence_parallel,
+                "sequence_parallel_size": parallel.sp_size,
+                "source_patch_sha256": os.environ.get(
+                    "AUTORESEARCH_EP4_W4A4_PATCH_SHA256"
+                ),
+                "source_post_sha256": json.loads(
+                    os.environ["AUTORESEARCH_EP4_W4A4_SOURCE_POST_SHA256_JSON"]
+                ),
+                "swiglu_alpha": layer.swiglu_alpha,
+                "swiglu_beta": layer.swiglu_beta,
+                "swiglu_limit": layer.swiglu_limit,
+                "tp_group_ranks": list(tp_group.ranks),
+                "tp_rank": tp_group.rank_in_group,
+                "tp_size": tp_group.world_size,
+                "weight_partition_kind": (
+                    "expert_parallel_full_expert_shard"
+                    if parallel.use_ep
+                    else "tensor_parallel_intermediate_shard"
+                ),
+                "weight_quant": "nvfp4_static",
+            }
+            logger.info(
+                "AUTORESEARCH_MINIMAX_M3_SP_W4A4_PROOF_JSON=%s",
+                json.dumps(record, sort_keys=True, separators=(",", ":")),
+            )
+            _AUTORESEARCH_SP_RESIDENCY_PROOF_EMITTED = True
 
     def maybe_make_prepare_finalize(
         self,

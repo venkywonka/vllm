@@ -12,6 +12,8 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
+import json
+import os
 from collections.abc import Iterable
 
 import torch
@@ -23,6 +25,7 @@ from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_world_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
@@ -839,6 +842,58 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             layer.fuse_input_allreduce = index > 0 and previous_ffn_defers
             previous_ffn_defers = layer.ffn_all_reduce_deferred
         self.fuse_final_allreduce = previous_ffn_defers
+
+        if os.environ.get("AUTORESEARCH_SP_MODEL_PROOF") == "1":
+            local_layers = list(self.layers[self.start_layer : self.end_layer])
+            moe_layers = [layer for layer in local_layers if layer.is_moe_layer]
+            if not moe_layers:
+                raise RuntimeError("MiniMax-M3 SP proof found no local MoE layers")
+            first_moe = moe_layers[0]
+            moe = first_moe.block_sparse_moe
+            shared = moe.shared_experts
+            if shared is None:
+                raise RuntimeError("MiniMax-M3 SP proof found no shared expert")
+            proof = {
+                "cuda_device_index": torch.cuda.current_device(),
+                "ffn_all_reduce_deferred": [
+                    layer.ffn_all_reduce_deferred for layer in local_layers
+                ],
+                "first_moe_fuse_input_allreduce": first_moe.fuse_input_allreduce,
+                "first_moe_layer_id": first_moe.layer_id,
+                "fuse_final_allreduce": self.fuse_final_allreduce,
+                "fuse_input_allreduce": [
+                    layer.fuse_input_allreduce for layer in local_layers
+                ],
+                "global_rank": get_world_group().rank,
+                "is_moe_layer": [layer.is_moe_layer for layer in local_layers],
+                "moe_is_sequence_parallel": moe.is_sequence_parallel,
+                "routed_reduce_results": moe.experts.reduce_results,
+                "schema_version": 1,
+                "shared_down_proj_reduce_results": shared.down_proj.reduce_results,
+                "shared_down_proj_tp_size": shared.down_proj.tp_size,
+                "shared_expert_class": shared.__class__.__name__,
+                "shared_gate_up_proj_tp_size": shared.gate_up_proj.tp_size,
+            }
+            print(
+                "AUTORESEARCH_MINIMAX_M3_SP_MODEL_PROOF_JSON="
+                + json.dumps(proof, sort_keys=True, separators=(",", ":")),
+                flush=True,
+            )
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        EagleModelMixin._set_aux_hidden_state_layers(self, layers)
+        if os.environ.get("AUTORESEARCH_SP_MODEL_PROOF") == "1":
+            proof = {
+                "aux_hidden_state_layers": list(layers),
+                "cuda_device_index": torch.cuda.current_device(),
+                "global_rank": get_world_group().rank,
+                "schema_version": 1,
+            }
+            print(
+                "AUTORESEARCH_MINIMAX_M3_EAGLE_AUX_PROOF_JSON="
+                + json.dumps(proof, sort_keys=True, separators=(",", ":")),
+                flush=True,
+            )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

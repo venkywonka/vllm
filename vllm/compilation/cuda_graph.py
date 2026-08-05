@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import json
+import os
 import weakref
 from collections import Counter
 from collections.abc import Callable
@@ -27,6 +29,7 @@ from vllm.platforms import current_platform
 from vllm.utils.torch_utils import current_stream, weak_ref_tensors
 
 logger = init_logger(__name__)
+_AUTORESEARCH_STABLE_REPLAY_EMITTED: set[tuple[int, str, str]] = set()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -353,6 +356,29 @@ class CUDAGraphWrapper:
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}"
             )
+
+            if os.environ.get("AUTORESEARCH_SP_GRAPH_PROOF") == "1":
+                device_index = torch.cuda.current_device()
+                descriptor = str(entry.batch_descriptor)
+                proof_key = (device_index, self.runtime_mode.name, descriptor)
+                if proof_key not in _AUTORESEARCH_STABLE_REPLAY_EMITTED:
+                    proof = {
+                        "batch_descriptor": descriptor,
+                        "cuda_device_index": device_index,
+                        "input_addresses": new_input_addresses,
+                        "input_addresses_stable": True,
+                        "runtime_mode": self.runtime_mode.name,
+                        "schema_version": 1,
+                    }
+                    logger.info(
+                        "AUTORESEARCH_CUDAGRAPH_STABLE_ADDRESS_REPLAY_JSON=%s",
+                        json.dumps(
+                            proof,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    )
+                    _AUTORESEARCH_STABLE_REPLAY_EMITTED.add(proof_key)
 
         # Sync offloader before replay - ensures any external dependencies
         # from pre-capture prefetches are satisfied.
