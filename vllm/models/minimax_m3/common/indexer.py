@@ -55,7 +55,8 @@ class MiniMaxM3IndexerBackend(AttentionBackend):
     """Indexer side-cache backend (key-only)."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16, torch.float16]
-    # bf16 today; mirrors the main backend to keep spec validation permissive.
+    # BF16 by default; SM100 MSA and the opt-in SM120 Triton qualification path
+    # also support an E4M3 side cache.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "bfloat16",
         "fp8",
@@ -464,7 +465,9 @@ def select_indexer_impl_cls(
     On Blackwell (SM100) with ``topk_blocks`` in ``(4, 8, 16, 32)`` (matching the
     main MSA attend), the fmha_sm100 score path + Triton top-k is used for both
     bf16 and fp8 index caches. Everything else falls back to the Triton indexer
-    (bf16 only).
+    (bf16 by default). On SM120, an explicit fp8 request with MiniMax-M3's
+    production ``topk_blocks == 16`` enables the Triton FP8 qualification path;
+    other non-BF16 Triton combinations continue to fail closed.
     """
     if indexer_kv_dtype in ("mxfp4", "nvfp4"):
         raise NotImplementedError(
@@ -473,6 +476,9 @@ def select_indexer_impl_cls(
         )
     is_sm100 = (
         current_platform.is_cuda() and current_platform.is_device_capability_family(100)
+    )
+    is_sm120 = (
+        current_platform.is_cuda() and current_platform.is_device_capability_family(120)
     )
     use_msa = (
         is_sm100
@@ -492,18 +498,33 @@ def select_indexer_impl_cls(
             indexer_kv_dtype,
         )
         return MiniMaxM3IndexerMSAImpl
-    if indexer_kv_dtype != "bf16":
+    use_sm120_triton_fp8 = (
+        is_sm120
+        and topk_blocks == 16
+        and indexer_kv_dtype in ("fp8", "fp8_e4m3")
+    )
+    if indexer_kv_dtype != "bf16" and not use_sm120_triton_fp8:
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."
         )
-    logger.info_once(
-        "MiniMax M3 indexer: selected Triton (no fmha_sm100) "
-        "[topk_blocks=%d, indexer_kv_dtype=%s, sm100=%s]",
-        topk_blocks,
-        indexer_kv_dtype,
-        is_sm100,
-    )
+    if use_sm120_triton_fp8:
+        # Deliberately loud and uniquely greppable runtime activation proof.
+        logger.warning_once(
+            "MiniMax M3 indexer: selected opt-in SM120 Triton FP8 "
+            "qualification path [topk_blocks=%d, indexer_kv_dtype=%s]",
+            topk_blocks,
+            indexer_kv_dtype,
+        )
+    else:
+        logger.info_once(
+            "MiniMax M3 indexer: selected Triton (no fmha_sm100) "
+            "[topk_blocks=%d, indexer_kv_dtype=%s, sm100=%s, sm120=%s]",
+            topk_blocks,
+            indexer_kv_dtype,
+            is_sm100,
+            is_sm120,
+        )
     return MiniMaxM3IndexerTritonImpl
 
 
