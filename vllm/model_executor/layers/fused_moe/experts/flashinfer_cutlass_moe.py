@@ -459,6 +459,7 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
             use_deepseek_fp8_block_scale=self.use_deepseek_fp8_block_scale,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             use_w4_group_scaling=use_w4_group_scaling,
+            use_fused_finalize=False,
             tune_max_num_tokens=max(self.max_capture_size, 1),
         )
 
