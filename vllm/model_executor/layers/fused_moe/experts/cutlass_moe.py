@@ -6,6 +6,7 @@ import torch
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm import _custom_ops as ops
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import (
     MoEActivation,
@@ -48,6 +49,7 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 
 logger = init_logger(__name__)
+_AUTORESEARCH_NVFP4_W4A4_CUTLASS_MARKER_EMITTED = False
 
 
 def run_cutlass_moe_fp8(
@@ -512,6 +514,9 @@ def run_cutlass_moe_fp4(
     e: int,
     device: torch.device,
     apply_router_weight_on_input: bool = False,
+    clamp_limit: float | None = None,
+    alpha: float = 1.0,
+    beta: float = 0.0,
 ) -> None:
     """
     MoE implementation for FP4 Inputs
@@ -633,7 +638,7 @@ def run_cutlass_moe_fp4(
         blockscale_offsets[:-1],
     )
     del rep_a_fp4, rep_a_blockscale
-    if activation == MoEActivation.SILU:
+    if activation == MoEActivation.SILU and clamp_limit is None:
         # Fused SiLU+Mul+NVFP4 quantization
         # Note: c2 workspace is no longer needed since SiLU is fused with quantization.
         # c3 reuses workspace13 after c1 is consumed.
@@ -641,7 +646,14 @@ def run_cutlass_moe_fp4(
             c1, a2_gscale, expert_offsets, blockscale_offsets, num_topk
         )
     else:
-        apply_moe_activation(activation, c2, c1)
+        apply_moe_activation(
+            activation,
+            c2,
+            c1,
+            clamp_limit=clamp_limit,
+            alpha=alpha,
+            beta=beta,
+        )
         int_fp4, int_blockscale = ops.scaled_fp4_experts_quant(
             c2, a2_gscale, expert_offsets, blockscale_offsets, num_topk
         )
@@ -659,18 +671,25 @@ def run_cutlass_moe_fp4(
     )
     del int_fp4, int_blockscale
 
-    c3 = ops.shuffle_rows(c3, c_map)
+    assert (
+        output.untyped_storage().data_ptr()
+        != workspace13.untyped_storage().data_ptr()
+    ), "fused unpermute source and destination must use disjoint storage"
 
     assert output.dtype == out_dtype
     if not apply_router_weight_on_input:
-        output.copy_(
-            (
-                c3.view(m, num_topk, k)
-                * topk_weights.view(m, num_topk, 1).to(out_dtype)
-            ).sum(dim=1),
-            non_blocking=True,
+        moe_unpermute(
+            out=output,
+            permuted_hidden_states=c3,
+            topk_weights=topk_weights,
+            inv_permuted_idx=c_map.view(m, num_topk),
+            # Legacy get_cutlass_moe_mm_data emits int32 expert offsets,
+            # while moe_unpermute's optional offsets must be int64. EP1 has
+            # no skipped expert rows, so the correct value is None.
+            expert_first_token_offset=None,
         )
     else:
+        c3 = ops.shuffle_rows(c3, c_map)
         output.copy_(c3.view(m, num_topk, k).sum(dim=1), non_blocking=True)
     return
 
@@ -721,6 +740,7 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.SWIGLUSTEP,
             MoEActivation.SILU_NO_MUL,
             MoEActivation.GELU_NO_MUL,
@@ -737,6 +757,10 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
     @staticmethod
     def activation_format() -> mk.FusedMoEActivationFormat:
         return mk.FusedMoEActivationFormat.Standard
+
+    @staticmethod
+    def supports_output_alias() -> bool:
+        return True
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
@@ -780,6 +804,32 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
     ):
         e, m, n, k, _ = self.moe_problem_size(hidden_states, w1, w2, topk_ids)
         n = w2.shape[2] * 2
+        clamp_limit = self.quant_config.gemm1_clamp_limit
+        if clamp_limit is None:
+            clamp_limit = self.moe_config.swiglu_limit
+        alpha = self.quant_config.gemm1_alpha
+        if alpha is None:
+            alpha = self.moe_config.swiglu_alpha
+        alpha = 1.0 if alpha is None else alpha
+        beta = self.quant_config.gemm1_beta
+        if beta is None:
+            beta = self.moe_config.swiglu_beta
+        beta = 0.0 if beta is None else beta
+
+        global _AUTORESEARCH_NVFP4_W4A4_CUTLASS_MARKER_EMITTED
+        if not _AUTORESEARCH_NVFP4_W4A4_CUTLASS_MARKER_EMITTED:
+            logger.info(
+                "AUTORESEARCH_NVFP4_W4A4_CUTLASS tp_rank=%d "
+                "activation=%s clamp_limit=%s alpha=%s beta=%s "
+                "input_quant=nvfp4_dynamic weight_quant=nvfp4_static "
+                "output_reduce=moe_unpermute output_alias=outer",
+                get_tensor_model_parallel_rank(),
+                activation.value,
+                clamp_limit,
+                alpha,
+                beta,
+            )
+            _AUTORESEARCH_NVFP4_W4A4_CUTLASS_MARKER_EMITTED = True
 
         run_cutlass_moe_fp4(
             output=output,
@@ -803,6 +853,9 @@ class CutlassExpertsFp4(mk.FusedMoEExpertsModular):
             e=e,
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            clamp_limit=clamp_limit,
+            alpha=alpha,
+            beta=beta,
         )
 
 

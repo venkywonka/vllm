@@ -769,6 +769,10 @@ class FusedMoEExpertsModular(FusedMoEExperts):
     def is_monolithic() -> bool:
         return False
 
+    @staticmethod
+    def supports_output_alias() -> bool:
+        return False
+
     def moe_problem_size(
         self,
         a1: torch.Tensor,
@@ -1247,20 +1251,23 @@ class FusedMoEKernelModularImpl:
 
         # If caller's output buffer already matches fused_out shape/dtype, alias
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
-        # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
-        # double-copy MoE write-back path).
+        # Aliasing is opt-in because some experts reuse fused_out's backing
+        # storage as the final GEMM source.
+        can_alias = self.fused_experts.supports_output_alias()
         if current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
-            if (
-                rocm_aiter_ops.is_fused_moe_enabled()
-                and output_alias is not None
-                and output_alias.shape == fused_out.shape
-                and output_alias.dtype == fused_out.dtype
-                and output_alias.device == fused_out.device
-                and output_alias.is_contiguous()
-            ):
-                fused_out = output_alias
+            can_alias = can_alias or rocm_aiter_ops.is_fused_moe_enabled()
+
+        if (
+            can_alias
+            and output_alias is not None
+            and output_alias.shape == fused_out.shape
+            and output_alias.dtype == fused_out.dtype
+            and output_alias.device == fused_out.device
+            and output_alias.is_contiguous()
+        ):
+            fused_out = output_alias
 
         self.fused_experts.apply(
             output=fused_out,
