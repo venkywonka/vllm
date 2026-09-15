@@ -46,6 +46,7 @@ class GateLinear(ReplicatedLinear):
     ):
         is_hopper = current_platform.is_device_capability((9, 0))
         is_blackwell = current_platform.is_device_capability_family(100)
+        is_sm120 = current_platform.is_device_capability_family(120)
         can_use_specialized_kernels = (
             current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
         )
@@ -81,7 +82,7 @@ class GateLinear(ReplicatedLinear):
             not bias
             and self.weight.dtype == torch.float32
             and current_platform.is_cuda()
-            and (is_hopper or is_blackwell)
+            and (is_hopper or is_blackwell or is_sm120)
             and (input_size, output_size) in self.FP32_SUPPORTED_SHAPES
         )
 

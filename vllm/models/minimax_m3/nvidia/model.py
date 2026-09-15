@@ -21,8 +21,9 @@ from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMulWithClamp
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -56,12 +57,15 @@ from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsEagle3,
     SupportsMultiModal,
+    SupportsPP,
 )
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
+    make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
 )
@@ -79,12 +83,15 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     get_kv_quant_mode,
 )
+
+logger = init_logger(__name__)
 
 
 def _sparse_attention_layer_ids(config: PretrainedConfig) -> set[int]:
@@ -751,6 +758,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
 class MiniMaxM3Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    supports_aux_hidden_states_over_pp = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -761,12 +769,15 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
 
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.embed_tokens",
-        )
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         # Reserved top-k indices buffer shared by all sparse-attention indexer
         # layers (mirrors DeepseekV4); kept at a stable address so the indexer's
@@ -797,12 +808,39 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
 
-        self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer()
+        self._set_aux_hidden_state_layers(())
+
+        if get_pp_group().world_size > 1:
+            logger.info(
+                "MiniMax-M3 PP rank %d/%d: start_layer=%d end_layer=%d",
+                get_pp_group().rank_in_group,
+                get_pp_group().world_size,
+                self.start_layer,
+                self.end_layer,
+            )
 
         # The final decoder layer has no next layer, so its deferred all-reduce is
         # completed here in the model norm.
         self.fuse_final_allreduce = (
             vllm_config.parallel_config.pipeline_parallel_size == 1
+        )
+
+    def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        super()._set_aux_hidden_state_layers(layers)
+        # Reserve every tap received or produced by this stage before the
+        # runner allocates its static IntermediateTensors buffers. Forward
+        # visits layers in global order, regardless of the configured order.
+        self._pp_aux_hidden_state_layers = tuple(
+            sorted({idx for idx in layers if 0 <= idx <= self.end_layer})
+        )
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"]
+            + [f"aux_hidden_states_{idx}" for idx in self._pp_aux_hidden_state_layers],
+            self.config.hidden_size,
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -812,21 +850,41 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+            aux_hidden_states = self._maybe_add_hidden_state(
+                [], 0, hidden_states, residual
+            )
         else:
-            hidden_states = self.embed_input_ids(input_ids)
-        residual = None
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+            # Tap start_layer belongs to the stage that produced layer
+            # start_layer - 1, even though it is also this stage's input.
+            aux_hidden_states = [
+                intermediate_tensors[f"aux_hidden_states_{idx}"]
+                for idx in self._pp_aux_hidden_state_layers
+                if idx <= self.start_layer
+            ]
 
-        # EAGLE3 is not yet compatible with pipeline parallel
-        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
         for idx, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
             hidden_states, residual = layer(positions, hidden_states, residual)
             self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
+                aux_hidden_states, self.start_layer + idx + 1, hidden_states, residual
             )
+
+        if not get_pp_group().is_last_rank:
+            tensors = {"hidden_states": hidden_states, "residual": residual}
+            for idx, value in zip(self._pp_aux_hidden_state_layers, aux_hidden_states):
+                tensors[f"aux_hidden_states_{idx}"] = value
+            return IntermediateTensors(tensors)
 
         if self.fuse_final_allreduce and residual is not None:
             hidden_states, _ = fused_allreduce_gemma_rms_norm(
@@ -947,7 +1005,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
         return loaded_params
 
 
-class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
+class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     """MiniMax M3 (sparse/dense backbone) for causal language modeling."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
@@ -959,13 +1017,22 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
         self.model = MiniMaxM3Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        # Resolve the factory at call time: EAGLE3 sets its taps after loading.
+        return self.model.make_empty_intermediate_tensors(batch_size, dtype, device)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -974,10 +1041,16 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions, inputs_embeds)
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        return self.model(
+            input_ids,
+            positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
@@ -996,7 +1069,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsEagle3):
     dummy_inputs=MiniMaxM3VLDummyInputsBuilder,
 )
 class MiniMaxM3SparseForConditionalGeneration(
-    nn.Module, SupportsMultiModal, SupportsEagle3
+    nn.Module, SupportsMultiModal, SupportsPP, SupportsEagle3
 ):
     """Top-level (VL) entry point for MiniMax M3.
 
@@ -1067,6 +1140,13 @@ class MiniMaxM3SparseForConditionalGeneration(
     @property
     def lm_head(self) -> nn.Module:
         return self.language_model.lm_head
+
+    def make_empty_intermediate_tensors(
+        self, batch_size: int, dtype: torch.dtype, device: torch.device
+    ) -> IntermediateTensors:
+        return self.language_model.make_empty_intermediate_tensors(
+            batch_size, dtype, device
+        )
 
     def _parse_and_validate_image_input(self, **kwargs: object) -> dict | None:
         pixel_values = kwargs.pop("pixel_values", None)
@@ -1176,10 +1256,16 @@ class MiniMaxM3SparseForConditionalGeneration(
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
+        intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
-    ) -> torch.Tensor:
-        return self.language_model(input_ids, positions, inputs_embeds)
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
+        return self.language_model(
+            input_ids,
+            positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+        )
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.language_model.compute_logits(hidden_states)

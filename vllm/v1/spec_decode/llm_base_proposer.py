@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from dataclasses import dataclass
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -7,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
 from vllm.config import (
     CUDAGraphMode,
@@ -14,6 +16,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     replace,
 )
+from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
@@ -27,9 +30,14 @@ from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.torch_utils import current_stream
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
-from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+from vllm.v1.attention.backends.triton_attn import (
+    TritonAttentionBackend,
+    TritonAttentionMetadata,
+    TritonAttentionMetadataBuilder,
+)
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig, UniformTypeKVCacheSpecs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -55,6 +63,29 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+_DRAFT_ATTN_METADATA_LOG_INTERVAL = 16_384
+_MISSING_DRAFT_ATTN_BUILDER_CONFIG = object()
+_NO_DRAFT_CHAIN_REPLAY = object()
+# A chain graph can retain additional shared-pool memory after the Stage 1
+# PIECEWISE graphs have been profiled. Keep it fail-closed until that memory can
+# be bounded without changing the KV cache capacity selected for the lane.
+_DRAFT_CHAIN_CUDAGRAPH_ENABLED = False
+
+
+@dataclass
+class _DraftChainGraphEntry:
+    graph: Any
+    output: torch.Tensor
+    num_speculative_tokens: int
+    first_num_actual_tokens: int
+    first_input_batch_size: int
+    remaining_input_batch_size: int
+    token_indices_to_sample: torch.Tensor
+    num_rejected_tokens: torch.Tensor
+    seq_lens: torch.Tensor
+    block_table_tensor: torch.Tensor
+    references: tuple[Any, ...]
 
 
 class SpecDecodeBaseProposer:
@@ -243,6 +274,37 @@ class SpecDecodeBaseProposer:
             dtype=torch.int64,
             device=device,
         )
+
+        # The FlashAttention drafting builder mostly reconstructs Python
+        # containers around persistent tensors. Cache that topology only for
+        # the narrowly verified EAGLE3 path; all other paths rebuild normally.
+        self._draft_attn_metadata_cache: dict[
+            tuple[Any, ...],
+            tuple[list[object], dict[str, object]],
+        ] = {}
+        self._disabled_draft_attn_metadata_cache_keys: set[tuple[Any, ...]] = set()
+        self._draft_attn_metadata_cache_group_key: tuple[Any, ...] | None = None
+        self._draft_query_start_loc_cpu_cache: dict[int, torch.Tensor] = {}
+        self.metadata_template_builds = 0
+        self.metadata_template_hits = 0
+        self.metadata_template_fallbacks = 0
+
+        # Stage 2 captures the complete serial drafter chain. Entries bind the
+        # runner's persistent sequence lengths and block table; every other
+        # dynamic input is copied into proposer-owned storage before replay.
+        self._draft_chain_graphs: dict[tuple[Any, ...], _DraftChainGraphEntry] = {}
+        self._draft_chain_graph_capability_key: tuple[Any, ...] | None = None
+        self._draft_chain_graph_pool = (
+            current_platform.get_global_graph_pool()
+            if _DRAFT_CHAIN_CUDAGRAPH_ENABLED
+            else None
+        )
+        self._draft_chain_graph_is_profiling = False
+        self.draft_chain_graph_captures = 0
+        self.draft_chain_graph_replays = 0
+        self.draft_chain_graph_fallbacks = 0
+        self._draft_chain_forward_events = 0
+        self._draft_chain_graph_stats_by_k: dict[int, dict[str, int]] = {}
 
         # Determine allowed attention backends once during initialization.
         self.allowed_attn_types: tuple | None = None
@@ -494,13 +556,47 @@ class SpecDecodeBaseProposer:
             )
         )
 
-        per_group_attn_metadata, per_layer_attn_metadata = (
-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
-        )
+        if self.method == "eagle3" and _DRAFT_CHAIN_CUDAGRAPH_ENABLED:
+            draft_chain_output = self._try_replay_draft_chain_graph(
+                num_speculative_tokens=num_speculative_tokens,
+                num_tokens=num_tokens,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+            if draft_chain_output is not _NO_DRAFT_CHAIN_REPLAY:
+                return cast(torch.Tensor, draft_chain_output)
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(num_tokens)
-        )
+        if self._can_cache_draft_attn_metadata(common_attn_metadata, draft_index=0):
+            cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+                self._determine_batch_execution_and_padding(num_tokens)
+            )
+            if cudagraph_runtime_mode is CUDAGraphMode.PIECEWISE:
+                per_group_attn_metadata, per_layer_attn_metadata = (
+                    self._get_draft_attn_metadata(
+                        common_attn_metadata,
+                        draft_index=0,
+                        phase="first",
+                        input_batch_size=num_input_tokens,
+                        cudagraph_runtime_mode=cudagraph_runtime_mode,
+                        cache_is_supported=True,
+                    )
+                )
+            else:
+                self._record_metadata_template_event("fallback")
+                per_group_attn_metadata, per_layer_attn_metadata = (
+                    self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+                )
+        else:
+            if self.method == "eagle3":
+                self._record_metadata_template_event("fallback")
+            per_group_attn_metadata, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+            )
+            cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+                self._determine_batch_execution_and_padding(num_tokens)
+            )
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
@@ -594,9 +690,18 @@ class SpecDecodeBaseProposer:
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
         common_attn_metadata.query_start_loc = self.arange[: batch_size + 1]
-        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-            self.token_arange_np[: batch_size + 1]
-        ).clone()
+        cache_remaining_metadata = (
+            cudagraph_runtime_mode is CUDAGraphMode.PIECEWISE
+            and self._can_cache_draft_attn_metadata(common_attn_metadata, draft_index=1)
+        )
+        if cache_remaining_metadata:
+            common_attn_metadata.query_start_loc_cpu = (
+                self._get_draft_query_start_loc_cpu(batch_size)
+            )
+        else:
+            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+                self.token_arange_np[: batch_size + 1]
+            ).clone()
 
         # In padded drafter batch, we need to adjust the sequence lengths
         # to remove the "padding" (i.e. rejected tokens).
@@ -629,11 +734,23 @@ class SpecDecodeBaseProposer:
             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
             # loop iterations so we build once and reuse.
             if not self.constant_draft_positions or token_index == 0:
-                _, per_layer_attn_metadata = (
-                    self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=token_index + 1
+                if cache_remaining_metadata:
+                    _, per_layer_attn_metadata = self._get_draft_attn_metadata(
+                        common_attn_metadata,
+                        draft_index=token_index + 1,
+                        phase="remaining",
+                        input_batch_size=input_batch_size,
+                        cudagraph_runtime_mode=cudagraph_runtime_mode,
+                        cache_is_supported=True,
                     )
-                )
+                else:
+                    if self.method == "eagle3":
+                        self._record_metadata_template_event("fallback")
+                    _, per_layer_attn_metadata = (
+                        self.build_per_group_and_layer_attn_metadata(
+                            common_attn_metadata, draft_index=token_index + 1
+                        )
+                    )
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -916,6 +1033,1073 @@ class SpecDecodeBaseProposer:
             for layer_name in attn_group.layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
         return per_group_attn_metadata, per_layer_attn_metadata
+
+    def _get_draft_query_start_loc_cpu(self, batch_size: int) -> torch.Tensor:
+        query_start_loc_cpu = self._draft_query_start_loc_cpu_cache.get(batch_size)
+        if query_start_loc_cpu is None:
+            query_start_loc_cpu = torch.from_numpy(
+                self.token_arange_np[: batch_size + 1]
+            ).clone()
+            self._draft_query_start_loc_cpu_cache[batch_size] = query_start_loc_cpu
+        return query_start_loc_cpu
+
+    def _initialize_draft_attn_metadata_cache_capability(self) -> None:
+        """Prove the static part of the narrowly scoped cache contract."""
+        self._draft_attn_metadata_cache_group_key = None
+        self._draft_attn_metadata_cache.clear()
+        self._disabled_draft_attn_metadata_cache_keys.clear()
+        if (
+            self.method != "eagle3"
+            or self.parallel_drafting
+            or self.constant_draft_positions
+            or self.needs_extra_input_slots
+            or self.supports_mm_inputs
+            or self.uses_mrope
+            or (self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0)
+            or self.vllm_config.parallel_config.data_parallel_size != 1
+            or self.speculative_config.disable_padded_drafter_batch
+            or len(self.draft_attn_groups) != 1
+        ):
+            return
+
+        # Keep FlashAttention an optional dependency of this generic proposer.
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend,
+            FlashAttentionMetadataBuilder,
+        )
+
+        model = self.model
+        if isinstance(model, BreakableCUDAGraphWrapper):
+            model = model.unwrap()
+        if not isinstance(model, Eagle3LlamaForCausalLM):
+            return
+
+        attn_group = self.draft_attn_groups[0]
+        builder = attn_group.get_metadata_builder()
+        flash_attention_supported = (
+            attn_group.backend is FlashAttentionBackend
+            and type(builder) is FlashAttentionMetadataBuilder
+            and builder.dcp_world_size == 1
+        )
+        triton_attention_supported = (
+            attn_group.backend is TritonAttentionBackend
+            and type(builder) is TritonAttentionMetadataBuilder
+            and builder.vllm_config.parallel_config.decode_context_parallel_size == 1
+        )
+        if (
+            not (flash_attention_supported or triton_attention_supported)
+            or not attn_group.layer_names
+            or tuple(attn_group.layer_names) != tuple(builder.layer_names)
+            or set(attn_group.layer_names) != self._draft_attn_layer_names
+        ):
+            return
+
+        # Keep the group, backend, and builder identities in the per-forward key.
+        # Builder capture configuration is read into each stability key below.
+        self._draft_attn_metadata_cache_group_key = (
+            id(attn_group),
+            attn_group.backend,
+            id(builder),
+        )
+
+    def _initialize_draft_chain_graph_capability(self) -> None:
+        """Prove the static contract for complete drafter-chain capture.
+
+        Unlike the Stage 1 metadata cache, chain capture intentionally admits
+        only the exact Triton pair. Triton accepts ``max_seqlen_k`` but does not
+        use it in launch selection, kernel arguments, or masking; FlashAttention
+        does use the host scalar and therefore keeps the Stage 1 path.
+        """
+        self._draft_chain_graph_capability_key = None
+        self.clear_draft_chain_graphs(reset_stats=False)
+        if not _DRAFT_CHAIN_CUDAGRAPH_ENABLED:
+            return
+        parallel_config = self.vllm_config.parallel_config
+        if (
+            self._draft_attn_metadata_cache_group_key is None
+            or self.method != "eagle3"
+            or self.parallel_drafting
+            or self.constant_draft_positions
+            or self.needs_extra_input_slots
+            or self.supports_mm_inputs
+            or self.uses_mrope
+            or (self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0)
+            or self.speculative_config.disable_padded_drafter_batch
+            or self._enable_probabilistic_draft_probs
+            or self._share_mtp_indices
+            or self.max_batch_size != 1
+            or parallel_config.data_parallel_size != 1
+            or parallel_config.pipeline_parallel_size != 1
+            or self.vllm_config.lora_config is not None
+            or len(self.draft_attn_groups) != 1
+        ):
+            return
+
+        model = self.model
+        if isinstance(model, BreakableCUDAGraphWrapper):
+            model = model.unwrap()
+        if not isinstance(model, Eagle3LlamaForCausalLM):
+            return
+
+        attn_group = self.draft_attn_groups[0]
+        builder = attn_group.get_metadata_builder()
+        if (
+            attn_group.backend is not TritonAttentionBackend
+            or type(builder) is not TritonAttentionMetadataBuilder
+            or builder.vllm_config.parallel_config.decode_context_parallel_size != 1
+            or not attn_group.layer_names
+            or tuple(attn_group.layer_names) != tuple(builder.layer_names)
+            or set(attn_group.layer_names) != self._draft_attn_layer_names
+        ):
+            return
+
+        self._draft_chain_graph_capability_key = (
+            id(attn_group),
+            attn_group.backend,
+            id(builder),
+            self.use_local_argmax_reduction,
+            self.pass_hidden_states_to_model,
+        )
+
+    def _can_cache_draft_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+    ) -> bool:
+        if (
+            self._draft_attn_metadata_cache_group_key is None
+            or draft_index < 0
+            or draft_index >= max(self.num_speculative_tokens, 1)
+        ):
+            return False
+
+        if (
+            common_attn_metadata.causal is not True
+            or common_attn_metadata.mm_req_doc_ranges is not None
+            or common_attn_metadata.logits_indices_padded is not None
+            or common_attn_metadata.num_logits_indices is not None
+            or common_attn_metadata.encoder_seq_lens is not None
+            or common_attn_metadata.encoder_seq_lens_cpu is not None
+            or common_attn_metadata.dcp_local_seq_lens is not None
+            or common_attn_metadata.dcp_local_seq_lens_cpu is not None
+        ):
+            return False
+
+        query_start_loc = common_attn_metadata.query_start_loc
+        seq_lens = common_attn_metadata.seq_lens
+        block_table = common_attn_metadata.block_table_tensor
+        slot_mapping = common_attn_metadata.slot_mapping
+        if not all(
+            isinstance(tensor, torch.Tensor)
+            for tensor in (query_start_loc, seq_lens, block_table, slot_mapping)
+        ):
+            return False
+
+        num_reqs = common_attn_metadata.num_reqs
+        num_actual_tokens = common_attn_metadata.num_actual_tokens
+        return (
+            num_reqs > 0
+            and num_actual_tokens > 0
+            and common_attn_metadata.max_query_len > 0
+            and common_attn_metadata.max_seq_len > 0
+            and query_start_loc.ndim == 1
+            and query_start_loc.shape[0] == num_reqs + 1
+            and seq_lens.ndim == 1
+            and seq_lens.shape[0] == num_reqs
+            and block_table.ndim == 2
+            and block_table.shape[0] >= num_reqs
+            and slot_mapping.ndim == 1
+            and slot_mapping.shape[0] >= num_actual_tokens
+        )
+
+    def _draft_attn_metadata_cache_key_for(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+        phase: str,
+        input_batch_size: int,
+        cudagraph_runtime_mode: CUDAGraphMode,
+    ) -> tuple[Any, ...]:
+        builder = self.draft_attn_groups[0].get_metadata_builder()
+        return (
+            self._draft_attn_metadata_cache_group_key,
+            getattr(
+                builder,
+                "use_full_cuda_graph",
+                _MISSING_DRAFT_ATTN_BUILDER_CONFIG,
+            ),
+            getattr(
+                builder,
+                "max_cudagraph_size",
+                _MISSING_DRAFT_ATTN_BUILDER_CONFIG,
+            ),
+            getattr(
+                builder,
+                "max_num_splits",
+                _MISSING_DRAFT_ATTN_BUILDER_CONFIG,
+            ),
+            envs.VLLM_BATCH_INVARIANT,
+            self.num_speculative_tokens,
+            phase,
+            draft_index,
+            cudagraph_runtime_mode,
+            input_batch_size,
+            common_attn_metadata.num_reqs,
+            common_attn_metadata.batch_size(),
+            common_attn_metadata.num_actual_tokens,
+            common_attn_metadata.max_query_len,
+            common_attn_metadata.causal,
+            common_attn_metadata.query_start_loc.shape,
+            common_attn_metadata.seq_lens.shape,
+            common_attn_metadata.block_table_tensor.shape,
+            common_attn_metadata.slot_mapping.shape,
+        )
+
+    @staticmethod
+    def _draft_attn_tensor_binding_matches(cached: object, current: object) -> bool:
+        if not isinstance(cached, torch.Tensor) or not isinstance(
+            current, torch.Tensor
+        ):
+            return False
+        return (
+            cached.data_ptr() == current.data_ptr()
+            and cached.storage_offset() == current.storage_offset()
+            and cached.shape == current.shape
+            and cached.stride() == current.stride()
+            and cached.dtype == current.dtype
+            and cached.layout == current.layout
+            and cached.device == current.device
+        )
+
+    @classmethod
+    def _draft_attn_metadata_bindings_match(
+        cls,
+        cached: tuple[list[object], dict[str, object]],
+        common_attn_metadata: CommonAttentionMetadata,
+    ) -> bool:
+        attn_metadata = cast(Any, cached[0][0])
+        return (
+            cls._draft_attn_tensor_binding_matches(
+                attn_metadata.query_start_loc,
+                common_attn_metadata.query_start_loc,
+            )
+            and cls._draft_attn_tensor_binding_matches(
+                attn_metadata.seq_lens,
+                common_attn_metadata.seq_lens,
+            )
+            and cls._draft_attn_tensor_binding_matches(
+                attn_metadata.block_table,
+                common_attn_metadata.block_table_tensor,
+            )
+            and cls._draft_attn_tensor_binding_matches(
+                attn_metadata.slot_mapping,
+                common_attn_metadata.slot_mapping,
+            )
+        )
+
+    @classmethod
+    def _draft_attn_metadata_matches_common(
+        cls,
+        cached: tuple[list[object], dict[str, object]],
+        common_attn_metadata: CommonAttentionMetadata,
+        attn_group: AttentionGroup,
+    ) -> bool:
+        from vllm.v1.attention.backends.flash_attn import (
+            FlashAttentionBackend,
+            FlashAttentionMetadata,
+            FlashAttentionMetadataBuilder,
+        )
+
+        per_group_attn_metadata, per_layer_attn_metadata = cached
+        if len(per_group_attn_metadata) != 1 or set(per_layer_attn_metadata) != set(
+            attn_group.layer_names
+        ):
+            return False
+
+        attn_metadata = cast(Any, per_group_attn_metadata[0])
+        if any(
+            per_layer_attn_metadata[layer_name] is not attn_metadata
+            for layer_name in attn_group.layer_names
+        ):
+            return False
+
+        builder = attn_group.get_metadata_builder()
+        flash_metadata_supported = (
+            attn_group.backend is FlashAttentionBackend
+            and type(builder) is FlashAttentionMetadataBuilder
+            and type(attn_metadata) is FlashAttentionMetadata
+        )
+        triton_metadata_supported = (
+            attn_group.backend is TritonAttentionBackend
+            and type(builder) is TritonAttentionMetadataBuilder
+            and type(attn_metadata) is TritonAttentionMetadata
+        )
+        if not (flash_metadata_supported or triton_metadata_supported):
+            return False
+
+        common_metadata_matches = (
+            attn_metadata.num_actual_tokens == common_attn_metadata.num_actual_tokens
+            and attn_metadata.max_query_len == common_attn_metadata.max_query_len
+            and attn_metadata.max_seq_len == common_attn_metadata.max_seq_len
+            and cls._draft_attn_metadata_bindings_match(cached, common_attn_metadata)
+            and attn_metadata.use_cascade is False
+            and attn_metadata.common_prefix_len == 0
+            and attn_metadata.cu_prefix_query_lens is None
+            and attn_metadata.prefix_kv_lens is None
+            and attn_metadata.suffix_kv_lens is None
+            and attn_metadata.scheduler_metadata is None
+            and attn_metadata.prefix_scheduler_metadata is None
+            and attn_metadata.causal is common_attn_metadata.causal
+            and attn_metadata.mm_prefix_range_tensor is None
+        )
+        if not common_metadata_matches:
+            return False
+
+        if flash_metadata_supported:
+            flash_metadata = cast(FlashAttentionMetadata, attn_metadata)
+            return (
+                flash_metadata.max_dcp_context_kv_len == 0
+                and flash_metadata.dcp_context_kv_lens is None
+            )
+        triton_metadata = cast(TritonAttentionMetadata, attn_metadata)
+        triton_builder = cast(TritonAttentionMetadataBuilder, builder)
+        return (
+            triton_metadata.seq_threshold_3D == triton_builder.seq_threshold_3D
+            and triton_metadata.num_par_softmax_segments
+            == triton_builder.num_par_softmax_segments
+            and cls._draft_attn_tensor_binding_matches(
+                triton_metadata.softmax_segm_output,
+                triton_builder.softmax_segm_output,
+            )
+            and cls._draft_attn_tensor_binding_matches(
+                triton_metadata.softmax_segm_max,
+                triton_builder.softmax_segm_max,
+            )
+            and cls._draft_attn_tensor_binding_matches(
+                triton_metadata.softmax_segm_expsum,
+                triton_builder.softmax_segm_expsum,
+            )
+            and triton_metadata.mm_prefix_range is None
+        )
+
+    def _record_metadata_template_event(self, event: str) -> None:
+        if event == "build":
+            self.metadata_template_builds += 1
+            event_total = self.metadata_template_builds
+        elif event == "hit":
+            self.metadata_template_hits += 1
+            event_total = self.metadata_template_hits
+        else:
+            assert event == "fallback"
+            self.metadata_template_fallbacks += 1
+            event_total = self.metadata_template_fallbacks
+
+        event_count = (
+            self.metadata_template_builds
+            + self.metadata_template_hits
+            + self.metadata_template_fallbacks
+        )
+        snapshot = None
+        if event_total == 1:
+            snapshot = f"first-{event}"
+        elif event_count % _DRAFT_ATTN_METADATA_LOG_INTERVAL == 0:
+            snapshot = "periodic"
+        if snapshot is not None:
+            self.log_draft_attn_metadata_cache_stats(snapshot)
+
+    def log_draft_attn_metadata_cache_stats(self, snapshot: str) -> None:
+        logger.info(
+            "EAGLE3 draft attention metadata cache: "
+            "worker snapshot=%s, builds=%d, hits=%d, fallbacks=%d, entries=%d",
+            snapshot,
+            self.metadata_template_builds,
+            self.metadata_template_hits,
+            self.metadata_template_fallbacks,
+            len(self._draft_attn_metadata_cache),
+        )
+
+    def get_draft_attn_metadata_cache_stats(self) -> dict[str, Any]:
+        return {
+            "metadata_template_builds": self.metadata_template_builds,
+            "metadata_template_hits": self.metadata_template_hits,
+            "metadata_template_fallbacks": self.metadata_template_fallbacks,
+            "metadata_template_entries": len(self._draft_attn_metadata_cache),
+        }
+
+    def _record_draft_chain_graph_event(
+        self,
+        event: str,
+        num_drafter_forwards: int = 0,
+        num_speculative_tokens: int | None = None,
+    ) -> None:
+        k = (
+            self.num_speculative_tokens
+            if num_speculative_tokens is None
+            else num_speculative_tokens
+        )
+        stats = self._draft_chain_graph_stats_by_k.setdefault(
+            k,
+            {
+                "captures": 0,
+                "replays": 0,
+                "fallbacks": 0,
+                "forward_events": 0,
+            },
+        )
+        if event == "capture":
+            self.draft_chain_graph_captures += 1
+            stats["captures"] += 1
+            event_total = stats["captures"]
+        elif event == "replay":
+            self.draft_chain_graph_replays += 1
+            stats["replays"] += 1
+            event_total = stats["replays"]
+        else:
+            assert event == "fallback"
+            self.draft_chain_graph_fallbacks += 1
+            stats["fallbacks"] += 1
+            event_total = stats["fallbacks"]
+
+        prior_forward_events = stats["forward_events"]
+        stats["forward_events"] += num_drafter_forwards
+        self._draft_chain_forward_events += num_drafter_forwards
+        snapshot = None
+        if event_total == 1:
+            snapshot = f"first-{event}"
+        elif (
+            prior_forward_events // _DRAFT_ATTN_METADATA_LOG_INTERVAL
+            < stats["forward_events"] // _DRAFT_ATTN_METADATA_LOG_INTERVAL
+        ):
+            snapshot = "periodic"
+        if snapshot is not None:
+            self.log_draft_chain_graph_stats(snapshot, k)
+
+    def log_draft_chain_graph_stats(
+        self, snapshot: str, num_speculative_tokens: int | None = None
+    ) -> None:
+        if num_speculative_tokens is None:
+            ks = sorted(self._draft_chain_graph_stats_by_k)
+            if not ks:
+                ks = [self.num_speculative_tokens]
+        else:
+            ks = [num_speculative_tokens]
+
+        for k in ks:
+            stats = self._draft_chain_graph_stats_by_k.get(k, {})
+            entries = sum(
+                getattr(entry, "num_speculative_tokens", None) == k
+                for entry in self._draft_chain_graphs.values()
+            )
+            logger.info(
+                "EAGLE3 drafter chain CUDA graph: "
+                "worker snapshot=%s, k=%d, enabled=%s, captures=%d, "
+                "replays=%d, fallbacks=%d, entries=%d",
+                snapshot,
+                k,
+                _DRAFT_CHAIN_CUDAGRAPH_ENABLED,
+                stats.get("captures", 0),
+                stats.get("replays", 0),
+                stats.get("fallbacks", 0),
+                entries,
+            )
+
+    def get_draft_chain_graph_stats(
+        self, num_speculative_tokens: int | None = None
+    ) -> dict[str, int]:
+        if num_speculative_tokens is not None:
+            stats = self._draft_chain_graph_stats_by_k.get(num_speculative_tokens, {})
+            entries = sum(
+                getattr(entry, "num_speculative_tokens", None) == num_speculative_tokens
+                for entry in self._draft_chain_graphs.values()
+            )
+            return {
+                "draft_chain_graph_captures": stats.get("captures", 0),
+                "draft_chain_graph_replays": stats.get("replays", 0),
+                "draft_chain_graph_fallbacks": stats.get("fallbacks", 0),
+                "draft_chain_graph_entries": entries,
+                "draft_chain_forward_events": stats.get("forward_events", 0),
+            }
+        return {
+            "draft_chain_graph_captures": self.draft_chain_graph_captures,
+            "draft_chain_graph_replays": self.draft_chain_graph_replays,
+            "draft_chain_graph_fallbacks": self.draft_chain_graph_fallbacks,
+            "draft_chain_graph_entries": len(self._draft_chain_graphs),
+            "draft_chain_forward_events": self._draft_chain_forward_events,
+        }
+
+    def clear_draft_chain_graphs(self, reset_stats: bool = False) -> None:
+        """Drop graphs before their bound KV cache or pool is released."""
+        if hasattr(self, "_draft_chain_graphs"):
+            self._draft_chain_graphs.clear()
+        if reset_stats:
+            self.draft_chain_graph_captures = 0
+            self.draft_chain_graph_replays = 0
+            self.draft_chain_graph_fallbacks = 0
+            self._draft_chain_forward_events = 0
+            self._draft_chain_graph_stats_by_k.clear()
+
+    def set_draft_chain_graph_pool(
+        self, graph_pool: Any, *, is_profiling: bool = False
+    ) -> None:
+        assert not self._draft_chain_graphs, (
+            "Draft chain graphs must be cleared before changing graph pools."
+        )
+        self._draft_chain_graph_pool = graph_pool
+        self._draft_chain_graph_is_profiling = is_profiling
+
+    @staticmethod
+    def _draft_chain_tensor_signature(tensor: torch.Tensor) -> tuple[Any, ...]:
+        return (
+            tensor.shape,
+            tensor.stride(),
+            tensor.dtype,
+            tensor.layout,
+            tensor.device,
+        )
+
+    def _draft_chain_graph_key_for(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_speculative_tokens: int,
+        first_num_actual_tokens: int,
+        first_input_batch_size: int,
+        remaining_input_batch_size: int,
+    ) -> tuple[Any, ...]:
+        return (
+            self._draft_chain_graph_capability_key,
+            num_speculative_tokens,
+            first_num_actual_tokens,
+            first_input_batch_size,
+            remaining_input_batch_size,
+            self.block_size,
+            self.max_model_len,
+            self._draft_chain_tensor_signature(common_attn_metadata.seq_lens),
+            self._draft_chain_tensor_signature(common_attn_metadata.block_table_tensor),
+        )
+
+    def _can_use_draft_chain_graph(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_speculative_tokens: int,
+        first_num_actual_tokens: int,
+        token_indices_to_sample: torch.Tensor | None,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+    ) -> tuple[tuple[Any, ...], int, int] | None:
+        max_capture_size = self.compilation_config.max_cudagraph_capture_size
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        if (
+            self._draft_chain_graph_capability_key is None
+            or self.speculative_config.enforce_eager
+            or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+            or num_speculative_tokens < 2
+            or first_num_actual_tokens != num_speculative_tokens + 1
+            or max_capture_size is None
+            or first_num_actual_tokens > max_capture_size
+            or token_indices_to_sample is None
+            or token_indices_to_sample.numel() != 1
+            or mm_embed_inputs is not None
+            or self._share_mtp_indices
+            or self._enable_probabilistic_draft_probs
+            or common_attn_metadata.num_reqs != 1
+            or common_attn_metadata.batch_size() != 1
+            or common_attn_metadata.num_actual_tokens != first_num_actual_tokens
+            or common_attn_metadata.max_query_len != first_num_actual_tokens
+            or query_start_loc_cpu.device.type != "cpu"
+            or query_start_loc_cpu.shape != (2,)
+            or query_start_loc_cpu.tolist() != [0, first_num_actual_tokens]
+            or not self._can_cache_draft_attn_metadata(
+                common_attn_metadata, draft_index=0
+            )
+        ):
+            return None
+
+        first_mode, first_input_batch_size, first_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(first_num_actual_tokens)
+        )
+        remaining_mode, remaining_input_batch_size, remaining_tokens_across_dp = (
+            self._determine_batch_execution_and_padding(1)
+        )
+        if (
+            first_mode is not CUDAGraphMode.PIECEWISE
+            or remaining_mode is not CUDAGraphMode.PIECEWISE
+            or first_tokens_across_dp is not None
+            or remaining_tokens_across_dp is not None
+            or first_input_batch_size > max_capture_size
+            or remaining_input_batch_size > max_capture_size
+        ):
+            return None
+
+        key = self._draft_chain_graph_key_for(
+            common_attn_metadata,
+            num_speculative_tokens,
+            first_num_actual_tokens,
+            first_input_batch_size,
+            remaining_input_batch_size,
+        )
+        return key, first_input_batch_size, remaining_input_batch_size
+
+    def _make_draft_chain_common_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        *,
+        num_actual_tokens: int,
+        query_start_loc: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> CommonAttentionMetadata:
+        # ``max_seq_len`` is deliberately capture-static. For the exact Triton
+        # backend admitted above it is unused after being passed to
+        # unified_attention; device seq_lens controls masking and loop bounds.
+        return common_attn_metadata.replace(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            num_reqs=1,
+            num_actual_tokens=num_actual_tokens,
+            max_query_len=num_actual_tokens,
+            max_seq_len=self.max_model_len,
+            slot_mapping=slot_mapping,
+            positions=positions,
+            seq_lens_cpu_upper_bound=None,
+            _seq_lens_cpu=None,
+            _num_computed_tokens_cpu=None,
+            _num_computed_tokens_cache=None,
+        )
+
+    def _update_positions_dependent_metadata_for_graph(
+        self,
+        positions: torch.Tensor,
+        common_attn_metadata: CommonAttentionMetadata,
+        input_batch_size: int,
+    ) -> torch.Tensor:
+        """Run only the device portion of the existing position update."""
+        out_positions = self.positions[:1]
+        eagle_step_update_slot_mapping_and_metadata(
+            positions_1d=positions,
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_size=self.block_size,
+            max_model_len=self.max_model_len,
+            out_clamped_positions=out_positions,
+            out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
+            input_batch_size=input_batch_size,
+        )
+        common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:1]
+        return out_positions
+
+    def _run_draft_chain_graph_body(
+        self,
+        *,
+        num_speculative_tokens: int,
+        first_input_batch_size: int,
+        remaining_input_batch_size: int,
+        token_indices_to_sample: torch.Tensor,
+        num_rejected_tokens: torch.Tensor,
+        first_attn_metadata: dict[str, object],
+        remaining_attn_metadata: list[dict[str, object]],
+        first_slot_mapping: dict[str, torch.Tensor],
+        remaining_slot_mapping: dict[str, torch.Tensor],
+        remaining_common_attn_metadata: CommonAttentionMetadata,
+    ) -> torch.Tensor:
+        first_model_kwargs, _ = self.build_model_inputs_first_pass(
+            num_speculative_tokens + 1,
+            first_input_batch_size,
+            mm_embed_inputs=None,
+        )
+        with set_forward_context(
+            first_attn_metadata,
+            self.vllm_config,
+            num_tokens=first_input_batch_size,
+            num_tokens_across_dp=None,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            slot_mapping=first_slot_mapping,
+        ):
+            model_output = self.model(**first_model_kwargs)
+            if self.model_returns_tuple():
+                last_hidden_states, hidden_states = model_output
+            else:
+                last_hidden_states = hidden_states = model_output
+
+        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        positions = self.positions[token_indices_to_sample]
+        hidden_states = hidden_states[token_indices_to_sample]
+        draft_token_ids = self._greedy_sample(sample_hidden_states)
+        draft_token_ids_list = [draft_token_ids]
+
+        # Always subtract a persistent buffer. It contains zero for the first
+        # proposal and the real rejection count thereafter.
+        remaining_common_attn_metadata.seq_lens.sub_(num_rejected_tokens)
+        for token_index in range(num_speculative_tokens - 1):
+            positions = self._update_positions_dependent_metadata_for_graph(
+                positions,
+                remaining_common_attn_metadata,
+                remaining_input_batch_size,
+            )
+            self.input_ids[:1].copy_(draft_token_ids.int())
+            self.hidden_states[:1].copy_(hidden_states)
+            model_kwargs = {
+                "input_ids": self.input_ids[:remaining_input_batch_size],
+                "positions": self.positions[:remaining_input_batch_size],
+                "inputs_embeds": None,
+            }
+            if self.pass_hidden_states_to_model:
+                model_kwargs["hidden_states"] = self.hidden_states[
+                    :remaining_input_batch_size
+                ]
+
+            with set_forward_context(
+                remaining_attn_metadata[token_index],
+                self.vllm_config,
+                num_tokens=remaining_input_batch_size,
+                num_tokens_across_dp=None,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                slot_mapping=remaining_slot_mapping,
+            ):
+                model_output = self.model(**model_kwargs)
+                if self.model_returns_tuple():
+                    last_hidden_states, hidden_states = model_output
+                else:
+                    last_hidden_states = hidden_states = model_output
+
+            hidden_states = hidden_states[:1]
+            draft_token_ids = self._greedy_sample(last_hidden_states[:1])
+            draft_token_ids_list.append(draft_token_ids)
+
+        return torch.stack(draft_token_ids_list, dim=1)
+
+    def _capture_draft_chain_graph(
+        self,
+        num_tokens: int,
+        common_attn_metadata: CommonAttentionMetadata | None,
+    ) -> bool:
+        """Capture one complete chain during the runner's capture window."""
+        if (
+            not _DRAFT_CHAIN_CUDAGRAPH_ENABLED
+            or common_attn_metadata is None
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        num_speculative_tokens = self.num_speculative_tokens
+        token_indices_to_sample = torch.full(
+            (1,), num_tokens - 1, dtype=torch.int64, device=self.device
+        )
+        graph_spec = self._can_use_draft_chain_graph(
+            common_attn_metadata,
+            num_speculative_tokens,
+            num_tokens,
+            token_indices_to_sample,
+            mm_embed_inputs=None,
+        )
+        if graph_spec is None:
+            return False
+        key, first_input_batch_size, remaining_input_batch_size = graph_spec
+        if key in self._draft_chain_graphs:
+            return True
+
+        self._get_slot_mapping(
+            first_input_batch_size, common_attn_metadata.slot_mapping
+        )
+        first_query_start_loc = torch.tensor(
+            [0, num_tokens], dtype=torch.int32, device=self.device
+        )
+        first_query_start_loc_cpu = torch.tensor([0, num_tokens], dtype=torch.int32)
+        remaining_query_start_loc = torch.tensor(
+            [0, 1], dtype=torch.int32, device=self.device
+        )
+        remaining_query_start_loc_cpu = torch.tensor([0, 1], dtype=torch.int32)
+        first_common = self._make_draft_chain_common_metadata(
+            common_attn_metadata,
+            num_actual_tokens=num_tokens,
+            query_start_loc=first_query_start_loc,
+            query_start_loc_cpu=first_query_start_loc_cpu,
+            slot_mapping=self._slot_mapping_buffer[:num_tokens],
+            positions=self.positions[:first_input_batch_size],
+        )
+        remaining_common = self._make_draft_chain_common_metadata(
+            common_attn_metadata,
+            num_actual_tokens=1,
+            query_start_loc=remaining_query_start_loc,
+            query_start_loc_cpu=remaining_query_start_loc_cpu,
+            slot_mapping=self._slot_mapping_buffer[:1],
+            positions=self.positions[:remaining_input_batch_size],
+        )
+
+        first_groups, first_layers = self.build_per_group_and_layer_attn_metadata(
+            first_common, draft_index=0
+        )
+        remaining_groups: list[list[object]] = []
+        remaining_layers: list[dict[str, object]] = []
+        for draft_index in range(1, num_speculative_tokens):
+            groups, layers = self.build_per_group_and_layer_attn_metadata(
+                remaining_common, draft_index=draft_index
+            )
+            remaining_groups.append(groups)
+            remaining_layers.append(layers)
+
+        attn_group = self.draft_attn_groups[0]
+        if not self._draft_attn_metadata_matches_common(
+            (first_groups, first_layers), first_common, attn_group
+        ) or any(
+            not self._draft_attn_metadata_matches_common(
+                (groups, layers), remaining_common, attn_group
+            )
+            for groups, layers in zip(remaining_groups, remaining_layers)
+        ):
+            return False
+
+        first_slot_mapping = self._get_slot_mapping(first_input_batch_size)
+        remaining_slot_mapping = {
+            name: self._slot_mapping_buffer[:remaining_input_batch_size]
+            for name in self._draft_attn_layer_names
+        }
+        num_rejected_tokens = torch.zeros(
+            (1,), dtype=common_attn_metadata.seq_lens.dtype, device=self.device
+        )
+
+        def run_chain() -> torch.Tensor:
+            return self._run_draft_chain_graph_body(
+                num_speculative_tokens=num_speculative_tokens,
+                first_input_batch_size=first_input_batch_size,
+                remaining_input_batch_size=remaining_input_batch_size,
+                token_indices_to_sample=token_indices_to_sample,
+                num_rejected_tokens=num_rejected_tokens,
+                first_attn_metadata=first_layers,
+                remaining_attn_metadata=remaining_layers,
+                first_slot_mapping=first_slot_mapping,
+                remaining_slot_mapping=remaining_slot_mapping,
+                remaining_common_attn_metadata=remaining_common,
+            )
+
+        # The eager call initializes compiled pieces and communicators before
+        # capture. Restore every mutable input it touches before recording.
+        saved_seq_lens = common_attn_metadata.seq_lens.clone()
+        saved_input_ids = self.input_ids[:first_input_batch_size].clone()
+        saved_positions = self.positions[:first_input_batch_size].clone()
+        saved_hidden_states = self.hidden_states[:first_input_batch_size].clone()
+        saved_slot_mapping = self._slot_mapping_buffer[:first_input_batch_size].clone()
+
+        def restore_inputs() -> None:
+            common_attn_metadata.seq_lens.copy_(saved_seq_lens)
+            self.input_ids[:first_input_batch_size].copy_(saved_input_ids)
+            self.positions[:first_input_batch_size].copy_(saved_positions)
+            self.hidden_states[:first_input_batch_size].copy_(saved_hidden_states)
+            self._slot_mapping_buffer[:first_input_batch_size].copy_(saved_slot_mapping)
+
+        run_chain()
+        restore_inputs()
+        torch.accelerator.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        graph_pool = self._draft_chain_graph_pool
+        if graph_pool is not None:
+            set_graph_pool_id(graph_pool)
+        else:
+            set_graph_pool_id(current_platform.graph_pool_handle())
+        with torch.cuda.graph(graph, pool=graph_pool, stream=current_stream()):
+            output = run_chain()
+        restore_inputs()
+
+        references = (
+            first_common,
+            remaining_common,
+            first_groups,
+            first_layers,
+            remaining_groups,
+            remaining_layers,
+            first_slot_mapping,
+            remaining_slot_mapping,
+        )
+        self._draft_chain_graphs[key] = _DraftChainGraphEntry(
+            graph=graph,
+            output=output,
+            num_speculative_tokens=num_speculative_tokens,
+            first_num_actual_tokens=num_tokens,
+            first_input_batch_size=first_input_batch_size,
+            remaining_input_batch_size=remaining_input_batch_size,
+            token_indices_to_sample=token_indices_to_sample,
+            num_rejected_tokens=num_rejected_tokens,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            references=references,
+        )
+        if not self._draft_chain_graph_is_profiling:
+            self._record_draft_chain_graph_event(
+                "capture", num_speculative_tokens=num_speculative_tokens
+            )
+        return True
+
+    def _reconcile_common_metadata_after_draft_chain(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_speculative_tokens: int,
+        had_rejected_tokens: bool,
+    ) -> None:
+        num_updates = num_speculative_tokens - 1
+        common_attn_metadata.num_actual_tokens = 1
+        common_attn_metadata.max_query_len = 1
+        common_attn_metadata.query_start_loc = self.arange[:2]
+        common_attn_metadata.query_start_loc_cpu = self._get_draft_query_start_loc_cpu(
+            1
+        )
+        common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:1]
+        common_attn_metadata.max_seq_len = min(
+            common_attn_metadata.max_seq_len + num_updates,
+            self.max_model_len,
+        )
+        if had_rejected_tokens:
+            common_attn_metadata._seq_lens_cpu = None
+            common_attn_metadata._num_computed_tokens_cpu = None
+        else:
+            if common_attn_metadata._seq_lens_cpu is not None:
+                common_attn_metadata._seq_lens_cpu += num_updates
+            if common_attn_metadata._num_computed_tokens_cpu is not None:
+                common_attn_metadata._num_computed_tokens_cpu += num_updates
+        if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
+            common_attn_metadata.seq_lens_cpu_upper_bound += num_updates
+
+    def _try_replay_draft_chain_graph(
+        self,
+        *,
+        num_speculative_tokens: int,
+        num_tokens: int,
+        token_indices_to_sample: torch.Tensor | None,
+        common_attn_metadata: CommonAttentionMetadata,
+        mm_embed_inputs: tuple[list[torch.Tensor], torch.Tensor] | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+    ) -> torch.Tensor | object:
+        if not _DRAFT_CHAIN_CUDAGRAPH_ENABLED:
+            return _NO_DRAFT_CHAIN_REPLAY
+        graph_spec = (
+            None
+            if num_rejected_tokens_gpu is None
+            else self._can_use_draft_chain_graph(
+                common_attn_metadata,
+                num_speculative_tokens,
+                num_tokens,
+                token_indices_to_sample,
+                mm_embed_inputs,
+            )
+        )
+        entry = (
+            None if graph_spec is None else self._draft_chain_graphs.get(graph_spec[0])
+        )
+        if (
+            entry is None
+            or not self._draft_attn_tensor_binding_matches(
+                entry.seq_lens, common_attn_metadata.seq_lens
+            )
+            or not self._draft_attn_tensor_binding_matches(
+                entry.block_table_tensor,
+                common_attn_metadata.block_table_tensor,
+            )
+            or common_attn_metadata.slot_mapping.shape[0] < num_tokens
+            or (
+                num_rejected_tokens_gpu is not None
+                and num_rejected_tokens_gpu.numel() != 1
+            )
+        ):
+            self._record_draft_chain_graph_event(
+                "fallback",
+                num_drafter_forwards=max(num_speculative_tokens, 1),
+                num_speculative_tokens=num_speculative_tokens,
+            )
+            return _NO_DRAFT_CHAIN_REPLAY
+
+        assert token_indices_to_sample is not None
+        entry.token_indices_to_sample.copy_(token_indices_to_sample)
+        if num_rejected_tokens_gpu is None:
+            entry.num_rejected_tokens.zero_()
+        else:
+            entry.num_rejected_tokens.copy_(num_rejected_tokens_gpu)
+        self._get_slot_mapping(
+            entry.first_input_batch_size, common_attn_metadata.slot_mapping
+        )
+        entry.graph.replay()
+        self._reconcile_common_metadata_after_draft_chain(
+            common_attn_metadata,
+            num_speculative_tokens,
+            had_rejected_tokens=num_rejected_tokens_gpu is not None,
+        )
+        self._record_draft_chain_graph_event(
+            "replay",
+            num_drafter_forwards=num_speculative_tokens,
+            num_speculative_tokens=num_speculative_tokens,
+        )
+        return entry.output
+
+    def _get_draft_attn_metadata(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        draft_index: int,
+        phase: str,
+        input_batch_size: int,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        cache_is_supported: bool = False,
+    ) -> tuple[list[object], dict[str, object]]:
+        if (
+            phase not in ("first", "remaining")
+            or (phase == "first") != (draft_index == 0)
+            or input_batch_size < common_attn_metadata.num_actual_tokens
+            or cudagraph_runtime_mode is not CUDAGraphMode.PIECEWISE
+            or (
+                not cache_is_supported
+                and not self._can_cache_draft_attn_metadata(
+                    common_attn_metadata, draft_index
+                )
+            )
+        ):
+            if self.method == "eagle3":
+                self._record_metadata_template_event("fallback")
+            return self.build_per_group_and_layer_attn_metadata(
+                common_attn_metadata, draft_index
+            )
+
+        stability_key = self._draft_attn_metadata_cache_key_for(
+            common_attn_metadata,
+            draft_index,
+            phase,
+            input_batch_size,
+            cudagraph_runtime_mode,
+        )
+        if stability_key in self._disabled_draft_attn_metadata_cache_keys:
+            self._record_metadata_template_event("fallback")
+            return self.build_per_group_and_layer_attn_metadata(
+                common_attn_metadata, draft_index
+            )
+
+        cache_entry = self._draft_attn_metadata_cache.get(stability_key)
+        if cache_entry is not None and not self._draft_attn_metadata_bindings_match(
+            cache_entry, common_attn_metadata
+        ):
+            self._draft_attn_metadata_cache.pop(stability_key, None)
+            self._disabled_draft_attn_metadata_cache_keys.add(stability_key)
+            self._record_metadata_template_event("fallback")
+            return self.build_per_group_and_layer_attn_metadata(
+                common_attn_metadata, draft_index
+            )
+
+        if cache_entry is not None:
+            cached = cache_entry
+            cast(Any, cached[0][0]).max_seq_len = common_attn_metadata.max_seq_len
+            self._record_metadata_template_event("hit")
+            return cached
+
+        built = self.build_per_group_and_layer_attn_metadata(
+            common_attn_metadata, draft_index
+        )
+        attn_group = self.draft_attn_groups[0]
+        if len(
+            self._draft_attn_metadata_cache
+        ) >= 256 or not self._draft_attn_metadata_matches_common(
+            built, common_attn_metadata, attn_group
+        ):
+            self._disabled_draft_attn_metadata_cache_keys.add(stability_key)
+            self._record_metadata_template_event("fallback")
+            return built
+
+        self._draft_attn_metadata_cache[stability_key] = built
+        self._record_metadata_template_event("build")
+        return built
 
     def model_returns_tuple(self) -> bool:
         if self.method == "mtp":
@@ -1508,7 +2692,16 @@ class SpecDecodeBaseProposer:
         use_cudagraphs: bool = True,
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
+        common_attn_metadata: CommonAttentionMetadata | None = None,
     ) -> None:
+        if (
+            is_graph_capturing
+            and self.method == "eagle3"
+            and _DRAFT_CHAIN_CUDAGRAPH_ENABLED
+            and self._capture_draft_chain_graph(num_tokens, common_attn_metadata)
+        ):
+            return
+
         # FIXME: when using tree-based specdec, adjust number of forward-passes
         # according to the depth of the tree.
         only_one_forward_pass = is_graph_capturing or self.parallel_drafting
@@ -1655,6 +2848,8 @@ class SpecDecodeBaseProposer:
         self.block_size = (
             self.draft_attn_groups[0].get_metadata_builder().kv_cache_spec.block_size
         )
+        self._initialize_draft_attn_metadata_cache_capability()
+        self._initialize_draft_chain_graph_capability()
         logger.debug("Using block size %d for drafting layers", self.block_size)
 
     def _determine_batch_execution_and_padding(

@@ -274,6 +274,7 @@ def kernel_unified_attention(
     USE_TD: tl.constexpr = False,
     USE_TD_QO: tl.constexpr = False,
     Q_IS_FP8: tl.constexpr = False,
+    REORDER_CAUSAL_PREFILL: tl.constexpr = False,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
     USE_FP8_Q_DESCALE: tl.constexpr = KV_QUANT_MODE == 1 and Q_IS_FP8
@@ -284,8 +285,26 @@ def kernel_unified_attention(
             "USE_TD requires BLOCK_SIZE to be a multiple of TILE_SIZE",
         )
 
-    q_block_global_idx = tl.program_id(0)
-    kv_head_idx = tl.program_id(1)
+    tl.static_assert(
+        not REORDER_CAUSAL_PREFILL
+        or (
+            USE_CAUSAL
+            and not USE_PER_SEQ_CAUSAL
+            and not USE_MM_PREFIX
+            and SLIDING_WINDOW <= 0
+            and CHUNK_LOOKBACK < 0
+            and not IS_3D
+        )
+    )
+
+    if REORDER_CAUSAL_PREFILL:
+        linear_program_idx = tl.program_id(0)
+        num_kv_heads = num_query_heads // num_queries_per_kv
+        q_block_global_idx = linear_program_idx // num_kv_heads
+        kv_head_idx = linear_program_idx % num_kv_heads
+    else:
+        q_block_global_idx = tl.program_id(0)
+        kv_head_idx = tl.program_id(1)
     segm_idx = tl.program_id(2) if IS_3D else 0
 
     (
@@ -300,6 +319,12 @@ def kernel_unified_attention(
 
     if q_block_local_idx * BLOCK_Q >= cur_batch_query_len:
         return
+
+    # Later causal query blocks have longer KV prefixes. Launch them first
+    # within each sequence and keep equal-cost KV-head programs adjacent.
+    if REORDER_CAUSAL_PREFILL:
+        num_local_q_blocks = cdiv_fn(cur_batch_query_len, BLOCK_Q)
+        q_block_local_idx = num_local_q_blocks - 1 - q_block_local_idx
 
     if IS_3D:
         tiles_per_segment = cdiv_fn(seq_len, NUM_SEGMENTS_PER_SEQ * TILE_SIZE)
@@ -818,6 +843,8 @@ def unified_attention(
     # The non-TD branch is dead-code-eliminated at Triton compile time so
     # disabling this flag costs nothing.
     use_td: bool = False,
+    # Reverse q-blocks per sequence and make KV head the fastest grid index.
+    reorder_causal_prefill: bool = False,
 ):
     # Resolve causal: bool or per-seq tensor.
     use_per_seq_causal = isinstance(causal, torch.Tensor)
@@ -972,11 +999,20 @@ def unified_attention(
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
+        or q.shape[0] > seq_threshold_3D
         or num_seqs > seq_threshold_3D
         or is_batch_invariant
     )
 
+    reorder_causal_prefill = (
+        reorder_causal_prefill
+        and use_causal
+        and not use_per_seq_causal
+        and not use_mm_prefix
+        and sliding_window_val <= 0
+        and chunk_lookback < 0
+        and not use_3d
+    )
     # The kernel signature is the same for 2D and 3D — only the launch
     # grid + a handful of constexpr toggles differ.  Per-token-head scale
     # caches and their strides are required arguments; non-per-token-head
@@ -1004,7 +1040,11 @@ def unified_attention(
 
     grid: tuple[Any, ...]
     if not use_3d:
-        grid = (total_num_q_blocks, num_kv_heads)
+        grid = (
+            (total_num_q_blocks * num_kv_heads,)
+            if reorder_causal_prefill
+            else (total_num_q_blocks, num_kv_heads)
+        )
         tile_size = TILE_SIZE_PREFILL
     else:
         grid = (total_num_q_blocks, num_kv_heads, num_par_softmax_segments)
@@ -1016,6 +1056,10 @@ def unified_attention(
     if launch_num_stages is not None:
         launch_kwargs["num_stages"] = launch_num_stages
 
+    if reorder_causal_prefill:
+        logger.info_once(
+            "ARIA upstream PR54344 active: reordered causal 2D Triton prefill"
+        )
     kernel_unified_attention[grid](
         output_ptr=out,
         segm_output_ptr=segm_output_ptr,
@@ -1088,6 +1132,7 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         USE_TD=use_td,
         USE_TD_QO=use_td_qo,
+        REORDER_CAUSAL_PREFILL=reorder_causal_prefill,
         **launch_kwargs,
     )
 

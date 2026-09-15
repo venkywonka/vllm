@@ -5,6 +5,9 @@ import importlib.machinery
 import os
 import sys
 import types
+from pkgutil import extend_path
+
+__path__ = extend_path(__path__, __name__)
 
 # In symlink mode (VLLM_FLASH_ATTN_SRC_DIR), cute/ is a symlink to the real
 # source tree and its files use `flash_attn.cute.*` imports (not rewritten).

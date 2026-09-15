@@ -640,13 +640,14 @@ class SupportsPP(Protocol):
         positions: Tensor,
         *,
         intermediate_tensors: IntermediateTensors | None,
-    ) -> IntermediateTensors | None:
+    ) -> Tensor | IntermediateTensors | tuple[Tensor, list[Tensor]]:
         """
         Accept [`IntermediateTensors`][vllm.sequence.IntermediateTensors] when
         PP rank > 0.
 
-        Return [`IntermediateTensors`][vllm.sequence.IntermediateTensors] only
-        for the last PP rank.
+        Return [`IntermediateTensors`][vllm.sequence.IntermediateTensors] on
+        intermediate PP ranks, or hidden states and optional auxiliary hidden
+        states on the last PP rank.
         """
         ...
 
@@ -670,7 +671,7 @@ class _SupportsPPType(Protocol):
         positions: Tensor,
         *,
         intermediate_tensors: IntermediateTensors | None,
-    ) -> Tensor | IntermediateTensors: ...
+    ) -> Tensor | IntermediateTensors | tuple[Tensor, list[Tensor]]: ...
 
 
 @overload

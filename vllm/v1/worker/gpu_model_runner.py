@@ -539,6 +539,22 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        # Earlier PP stages return IntermediateTensors, even when they collect
+        # EAGLE3 auxiliary states for the drafter on the last stage.
+        self.relay_aux_hidden_states = False
+        if (
+            self.speculative_config
+            and self.speculative_config.method == "eagle3"
+            and not get_pp_group().is_last_rank
+        ):
+            draft_model_config = self.speculative_config.draft_model_config
+            assert draft_model_config is not None
+            eagle_config = getattr(draft_model_config.hf_config, "eagle_config", None)
+            self.relay_aux_hidden_states = (
+                eagle_config.get("use_aux_hidden_state", True)
+                if eagle_config is not None
+                else True
+            )
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -634,6 +650,19 @@ class GPUModelRunner(
         self.use_async_spec_decode = (
             self.use_async_scheduling and self.num_spec_tokens > 0
         )
+        self.use_pp_async_spec_decode = (
+            self.use_async_spec_decode
+            and self.parallel_config.pipeline_parallel_size > 1
+            and self.speculative_config is not None
+            and self.speculative_config.method == "eagle3"
+            and not self.broadcast_pp_output
+        )
+        if self.use_pp_async_spec_decode:
+            logger.info(
+                "EAGLE3 PP async feedback enabled: PP rank %d/%d",
+                get_pp_group().rank_in_group,
+                get_pp_group().world_size,
+            )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1356,7 +1385,9 @@ class GPUModelRunner(
                         req_state.output_token_ids.extend(
                             new_token_ids[-num_new_tokens:]
                         )
-            elif num_output_tokens < len(req_state.output_token_ids):
+            if (
+                is_last_rank or self.use_pp_async_spec_decode
+            ) and num_output_tokens < len(req_state.output_token_ids):
                 # Some output tokens were discarded due to a sync-KV-load
                 # failure, or output_token_ids was inflated by the optimistic
                 # extend above (async spec decode). Align the cached state.
@@ -1404,8 +1435,9 @@ class GPUModelRunner(
                 self.input_batch.block_table.append_row(new_block_ids, req_index)
 
             # For the last rank, we don't need to update the token_ids_cpu
-            # because the sampled tokens are already cached.
-            if not is_last_rank:
+            # because the sampled tokens are already cached. Async EAGLE3 PP
+            # feedback gives earlier ranks the same cached-token semantics.
+            if not is_last_rank and not self.use_pp_async_spec_decode:
                 start_token_index = self.input_batch.num_tokens_no_spec[req_index]
                 # For chunked prefill, num_computed_tokens may less
                 # than num_tokens_no_spec.
@@ -2465,7 +2497,11 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(
                     self.drafter,
                     (
@@ -2480,11 +2516,19 @@ class GPUModelRunner(
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and isinstance(self.drafter, Step3p5MTPProposer)
+            ):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
-            elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            elif (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and isinstance(self.drafter, Gemma4Proposer)
+            ):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
@@ -4341,6 +4385,8 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    if deferred_state_corrections_fn:
+                        deferred_state_corrections_fn()
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -4467,7 +4513,12 @@ class GPUModelRunner(
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
-            if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
+            if (
+                not self.broadcast_pp_output
+                and pp.world_size > 1
+                and pp.is_last_rank
+                and not self.use_pp_async_spec_decode
+            ):
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
                 )
@@ -4497,7 +4548,7 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
-        if spec_config is not None:
+        if spec_config is not None and get_pp_group().is_last_rank:
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = self._input_fits_in_drafter(
                 spec_decode_common_attn_metadata
@@ -4593,6 +4644,9 @@ class GPUModelRunner(
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
+
+        if self.use_pp_async_spec_decode and get_pp_group().is_last_rank:
+            self._pp_broadcast_spec_decode_state()
 
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
@@ -4704,12 +4758,17 @@ class GPUModelRunner(
         pp = get_pp_group()
         assert not pp.is_last_rank
         num_reqs = self.input_batch.num_reqs
-        # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
-        recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
-        # skip for chunked prefill.
-        if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
-        self.input_batch.prev_sampled_token_ids = recv
+        if self.use_pp_async_spec_decode:
+            self._pp_receive_spec_decode_state()
+        else:
+            # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+            recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
+            # skip for chunked prefill.
+            if not self._is_all_reqs_chunked_prefill():
+                torch.distributed.broadcast(
+                    recv, src=pp.last_rank, group=pp.device_group
+                )
+            self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`
         # can map req_id -> previous batch row
@@ -4728,6 +4787,58 @@ class GPUModelRunner(
             self.input_batch.is_token_ids[i, pos] = True
             self.input_batch.num_tokens_no_spec[i] = pos + 1
         self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
+    def _pp_broadcast_spec_decode_state(self) -> None:
+        """Share async EAGLE3 feedback after the last stage has proposed drafts."""
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        next_token_ids = self.input_batch.prev_sampled_token_ids
+        draft_token_ids = self._draft_token_ids
+        valid_sampled_token_count = self.valid_sampled_token_count_gpu
+        assert next_token_ids is not None and next_token_ids.shape[-1] == 1
+        assert isinstance(draft_token_ids, torch.Tensor)
+        assert valid_sampled_token_count is not None
+        # Async SchedulerOutput carries draft placeholders. Earlier stages need
+        # the selected next token, actual drafts, and accepted-token counts.
+        pp.broadcast_tensor_dict(
+            {
+                "req_ids": self.input_batch.req_ids.copy(),
+                "next_token_ids": next_token_ids.contiguous(),
+                "draft_token_ids": draft_token_ids.contiguous(),
+                "valid_sampled_token_count": valid_sampled_token_count.contiguous(),
+            },
+            src=pp.world_size - 1,
+        )
+
+    def _pp_receive_spec_decode_state(self) -> None:
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        state = pp.broadcast_tensor_dict(src=pp.world_size - 1)
+        assert state is not None
+        req_ids = state["req_ids"]
+        local_req_ids = self.input_batch.req_ids
+        if req_ids != local_req_ids:
+            # Attention backends may order requests differently on each stage.
+            if len(req_ids) != len(local_req_ids) or set(req_ids) != set(local_req_ids):
+                raise RuntimeError("PP EAGLE3 feedback request IDs do not match")
+            src_indices = {req_id: i for i, req_id in enumerate(req_ids)}
+            indices = torch.tensor(
+                [src_indices[req_id] for req_id in local_req_ids],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            for key in (
+                "next_token_ids",
+                "draft_token_ids",
+                "valid_sampled_token_count",
+            ):
+                state[key] = state[key].index_select(0, indices)
+        draft_token_ids = state["draft_token_ids"]
+        self._draft_token_ids = draft_token_ids
+        self.prev_num_spec_tokens = draft_token_ids.shape[1]
+        self._copy_valid_sampled_token_count(
+            state["next_token_ids"][:, 0], state["valid_sampled_token_count"]
+        )
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if not self.num_spec_tokens or not self._draft_token_req_ids:
@@ -4862,6 +4973,7 @@ class GPUModelRunner(
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
     ) -> list[list[int]] | torch.Tensor:
+        assert get_pp_group().is_last_rank, "Only the last PP rank can propose drafts"
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
@@ -5319,13 +5431,21 @@ class GPUModelRunner(
         get_offloader().post_init()
 
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
-        if not self.use_aux_hidden_state_outputs:
+        if not (self.use_aux_hidden_state_outputs or self.relay_aux_hidden_states):
             return
 
-        if not supports_eagle3(self.get_model()):
+        model = self.get_model()
+        if not supports_eagle3(model):
             raise RuntimeError(
                 "Model does not support EAGLE3 interface but "
                 "aux_hidden_state_outputs was requested"
+            )
+        if get_pp_group().world_size > 1 and not getattr(
+            getattr(model, "model", None), "supports_aux_hidden_states_over_pp", False
+        ):
+            raise RuntimeError(
+                "Model does not support EAGLE3 auxiliary hidden states "
+                "with pipeline parallelism"
             )
         # Try to get auxiliary layers from speculative config,
         # otherwise use model's default layers
@@ -5811,6 +5931,7 @@ class GPUModelRunner(
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
+        spec_decode_common_attn_metadata: CommonAttentionMetadata | None = None
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens_padded,
@@ -5865,15 +5986,19 @@ class GPUModelRunner(
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                attn_metadata, _ = self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs_padded,
-                    max_query_len=max_query_len,
-                    ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
-                    for_cudagraph_capture=is_graph_capturing,
-                    slot_mappings=slot_mappings_by_group,
-                    use_spec_decode=self.speculative_config is not None,
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs_padded,
+                        max_query_len=max_query_len,
+                        ubatch_slices=(
+                            ubatch_slices_padded if pad_attn else ubatch_slices
+                        ),
+                        for_cudagraph_capture=is_graph_capturing,
+                        slot_mappings=slot_mappings_by_group,
+                        use_spec_decode=self.speculative_config is not None,
+                    )
                 )
 
         with self.maybe_dummy_run_with_lora(
@@ -5958,10 +6083,14 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -5996,12 +6125,21 @@ class GPUModelRunner(
                 ):
                     use_cudagraphs = False
 
-                self.drafter.dummy_run(
-                    num_tokens,
-                    use_cudagraphs=use_cudagraphs,
-                    is_graph_capturing=is_graph_capturing,
-                    slot_mappings=slot_mappings,
-                )
+                if isinstance(self.drafter, EagleProposer):
+                    self.drafter.dummy_run(
+                        num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                        common_attn_metadata=spec_decode_common_attn_metadata,
+                    )
+                else:
+                    self.drafter.dummy_run(
+                        num_tokens,
+                        use_cudagraphs=use_cudagraphs,
+                        is_graph_capturing=is_graph_capturing,
+                        slot_mappings=slot_mappings,
+                    )
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by
@@ -6344,6 +6482,12 @@ class GPUModelRunner(
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
 
+        drafter = getattr(self, "drafter", None)
+        if isinstance(drafter, EagleProposer) and drafter.method == "eagle3":
+            drafter.log_draft_attn_metadata_cache_stats("shutdown")
+            drafter.log_draft_chain_graph_stats("shutdown")
+            drafter.clear_draft_chain_graphs()
+
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()
         if current_platform.is_rocm():
@@ -6474,13 +6618,26 @@ class GPUModelRunner(
         # Use a temporary pool for profiling to avoid fragmentation in the main pool.
         profiling_pool = current_platform.graph_pool_handle()
         encoder_profiling_pool = current_platform.graph_pool_handle()
+        drafter = getattr(self, "drafter", None)
+        draft_chain_proposer = (
+            drafter
+            if isinstance(drafter, EagleProposer) and drafter.method == "eagle3"
+            else None
+        )
+        original_draft_chain_pool = (
+            draft_chain_proposer._draft_chain_graph_pool
+            if draft_chain_proposer is not None
+            else None
+        )
+        original_draft_chain_is_profiling = (
+            draft_chain_proposer._draft_chain_graph_is_profiling
+            if draft_chain_proposer is not None
+            else False
+        )
         original_pools: dict[int, Any] = {}
         all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
             BreakableCUDAGraphWrapper._all_instances
         )
-        for instance in all_wrappers:
-            original_pools[id(instance)] = instance.graph_pool
-            instance.graph_pool = profiling_pool
 
         shared_memory_estimate = {}
         per_graph_estimate = {}
@@ -6489,6 +6646,15 @@ class GPUModelRunner(
         # Cleanup-only guard: CUDA graph capture errors should still propagate
         # because encoder graph capture is opt-in.
         try:
+            if draft_chain_proposer is not None:
+                draft_chain_proposer.clear_draft_chain_graphs(reset_stats=True)
+                draft_chain_proposer.set_draft_chain_graph_pool(
+                    profiling_pool, is_profiling=True
+                )
+            for instance in all_wrappers:
+                original_pools[id(instance)] = instance.graph_pool
+                instance.graph_pool = profiling_pool
+
             set_cudagraph_capturing_enabled(True)
             with self._freeze_gc(), graph_capture(device=self.device):
                 torch.accelerator.synchronize()
@@ -6552,6 +6718,14 @@ class GPUModelRunner(
             BreakableCUDAGraphWrapper.clear_all_graphs()
             if encoder_cudagraph_manager is not None:
                 encoder_cudagraph_manager.clear()
+            if draft_chain_proposer is not None:
+                # Profiling graphs bind a temporary KV cache and cannot become
+                # runtime evidence. Destroy them and discard their counters.
+                draft_chain_proposer.clear_draft_chain_graphs(reset_stats=True)
+                draft_chain_proposer.set_draft_chain_graph_pool(
+                    original_draft_chain_pool,
+                    is_profiling=original_draft_chain_is_profiling,
+                )
             all_wrappers = list(CUDAGraphWrapper._all_instances) + list(
                 BreakableCUDAGraphWrapper._all_instances
             )
@@ -6865,9 +7039,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -6918,9 +7096,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -7379,6 +7561,7 @@ class GPUModelRunner(
 
         if (
             self.speculative_config
+            and get_pp_group().is_last_rank
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)

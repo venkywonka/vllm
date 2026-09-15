@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ import vllm.v1.worker.gpu_model_runner as gpu_model_runner_module
 from vllm.config import (
     AttentionConfig,
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
@@ -46,6 +48,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -57,6 +60,207 @@ from vllm.v1.worker.utils import select_common_block_size
 BLOCK_SIZE = 16
 NUM_BLOCKS = 10
 DEVICE_TYPE = current_platform.device_type
+
+
+def test_shutdown_logs_final_eagle3_metadata_cache_stats(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = object.__new__(GPUModelRunner)
+    drafter = object.__new__(EagleProposer)
+    drafter.method = "eagle3"
+    drafter.log_draft_attn_metadata_cache_stats = Mock()
+    drafter.log_draft_chain_graph_stats = Mock()
+    drafter.clear_draft_chain_graphs = Mock()
+    runner.drafter = drafter
+    runner._cleanup_profiling_kv_cache = Mock()
+    runner.compilation_config = SimpleNamespace(static_forward_context={})
+    runner.model = object()
+
+    reset_workspace_manager = Mock()
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "is_rocm",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "vllm.v1.worker.workspace.reset_workspace_manager",
+        reset_workspace_manager,
+    )
+
+    runner.shutdown()
+
+    drafter.log_draft_attn_metadata_cache_stats.assert_called_once_with("shutdown")
+    drafter.log_draft_chain_graph_stats.assert_called_once_with("shutdown")
+    drafter.clear_draft_chain_graphs.assert_called_once_with()
+    runner._cleanup_profiling_kv_cache.assert_called_once_with()
+    reset_workspace_manager.assert_called_once_with()
+
+
+def _make_cudagraph_profile_runner(monkeypatch: pytest.MonkeyPatch):
+    runner = object.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace()
+    runner.device = torch.device("cuda")
+    runner.max_model_len = 1024
+    runner.max_num_tokens = 4
+    runner.lora_config = None
+    runner._init_minimal_kv_cache_for_profiling = Mock()
+    runner._create_encoder_cudagraph_manager = Mock(return_value=None)
+    runner._freeze_gc = Mock(return_value=nullcontext())
+    runner._cleanup_profiling_kv_cache = Mock()
+    runner.maybe_remove_all_loras = Mock()
+    runner._warmup_and_capture = Mock()
+
+    desc = SimpleNamespace(num_tokens=4)
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=Mock(return_value=[(CUDAGraphMode.PIECEWISE, [desc])]),
+        cudagraph_keys={CUDAGraphMode.PIECEWISE: {desc.num_tokens}},
+        keys_initialized=True,
+    )
+
+    original_draft_pool = object()
+    drafter = object.__new__(EagleProposer)
+    drafter.method = "eagle3"
+    drafter._draft_chain_graphs = {}
+    drafter._draft_chain_graph_pool = original_draft_pool
+    drafter._draft_chain_graph_is_profiling = False
+    drafter.draft_chain_graph_captures = 0
+    drafter.draft_chain_graph_replays = 0
+    drafter.draft_chain_graph_fallbacks = 0
+    drafter._draft_chain_forward_events = 0
+    drafter._draft_chain_graph_stats_by_k = {}
+    runner.drafter = drafter
+
+    original_wrapper_pool = object()
+    wrapper = SimpleNamespace(graph_pool=original_wrapper_pool)
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper, "_all_instances", [wrapper]
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper, "_all_instances", []
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.CUDAGraphWrapper,
+        "clear_all_graphs",
+        Mock(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module.BreakableCUDAGraphWrapper,
+        "clear_all_graphs",
+        Mock(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_current_vllm_config",
+        lambda _: nullcontext(),
+    )
+    monkeypatch.setattr(
+        gpu_model_runner_module, "graph_capture", lambda **_: nullcontext()
+    )
+    set_capture_enabled = Mock()
+    monkeypatch.setattr(
+        gpu_model_runner_module,
+        "set_cudagraph_capturing_enabled",
+        set_capture_enabled,
+    )
+    monkeypatch.setattr(torch.accelerator, "synchronize", Mock())
+    monkeypatch.setattr(torch.accelerator, "empty_cache", Mock())
+
+    profiling_pool = object()
+    encoder_pool = object()
+    monkeypatch.setattr(
+        gpu_model_runner_module.current_platform,
+        "graph_pool_handle",
+        Mock(side_effect=[profiling_pool, encoder_pool]),
+    )
+
+    return (
+        runner,
+        drafter,
+        wrapper,
+        profiling_pool,
+        original_draft_pool,
+        original_wrapper_pool,
+        set_capture_enabled,
+    )
+
+
+def test_profile_cudagraph_memory_uses_and_restores_profiling_pool(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    (
+        runner,
+        drafter,
+        wrapper,
+        profiling_pool,
+        original_draft_pool,
+        original_wrapper_pool,
+        set_capture_enabled,
+    ) = _make_cudagraph_profile_runner(monkeypatch)
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        Mock(side_effect=[(100, 200), (90, 200)]),
+    )
+
+    def assert_profiling_pool(*args, **kwargs):
+        del args, kwargs
+        assert drafter._draft_chain_graph_pool is profiling_pool
+        assert drafter._draft_chain_graph_is_profiling is True
+        assert wrapper.graph_pool is profiling_pool
+
+    runner._warmup_and_capture.side_effect = assert_profiling_pool
+
+    assert runner.profile_cudagraph_memory() == 10
+    assert drafter._draft_chain_graph_pool is original_draft_pool
+    assert drafter._draft_chain_graph_is_profiling is False
+    assert wrapper.graph_pool is original_wrapper_pool
+    assert runner.cudagraph_dispatcher.keys_initialized is False
+    assert runner.cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.PIECEWISE] == set()
+    runner._cleanup_profiling_kv_cache.assert_called_once_with()
+    assert set_capture_enabled.call_args_list == [call(True), call(False)]
+
+
+@pytest.mark.parametrize("exception_site", ["capture", "accounting"])
+def test_profile_cudagraph_memory_restores_pools_on_exception(
+    monkeypatch: pytest.MonkeyPatch,
+    exception_site: str,
+):
+    (
+        runner,
+        drafter,
+        wrapper,
+        profiling_pool,
+        original_draft_pool,
+        original_wrapper_pool,
+        set_capture_enabled,
+    ) = _make_cudagraph_profile_runner(monkeypatch)
+    error = RuntimeError(f"{exception_site} failed")
+
+    def capture_profiling_graph(*args, **kwargs):
+        del args, kwargs
+        drafter._draft_chain_graphs[("profiling",)] = object()
+        if exception_site == "capture":
+            raise error
+
+    runner._warmup_and_capture.side_effect = capture_profiling_graph
+    if exception_site == "capture":
+        mem_get_info = Mock(return_value=(100, 200))
+    else:
+        mem_get_info = Mock(side_effect=[(100, 200), error])
+    monkeypatch.setattr(torch.cuda, "mem_get_info", mem_get_info)
+
+    with pytest.raises(RuntimeError, match=f"{exception_site} failed"):
+        runner.profile_cudagraph_memory()
+
+    assert drafter._draft_chain_graph_pool is original_draft_pool
+    assert drafter._draft_chain_graph_is_profiling is False
+    assert drafter._draft_chain_graphs == {}
+    assert wrapper.graph_pool is original_wrapper_pool
+    assert runner.cudagraph_dispatcher.keys_initialized is False
+    assert runner.cudagraph_dispatcher.cudagraph_keys[CUDAGraphMode.PIECEWISE] == set()
+    runner._cleanup_profiling_kv_cache.assert_called_once_with()
+    assert set_capture_enabled.call_args_list[-1] == call(False)
+    assert profiling_pool is not original_draft_pool
 
 
 def initialize_kv_cache(runner: GPUModelRunner):

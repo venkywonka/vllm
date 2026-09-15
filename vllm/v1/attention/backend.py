@@ -407,7 +407,7 @@ class CommonAttentionMetadata:
     metadata (e.g. C128A topk indices for DeepSeek V4)."""
 
     is_prefilling: torch.Tensor | None = None
-    """(batch_size,) bool tensor: True if request is still in prefill phase
+    """CPU (batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to
     distinguish actual decodes from short extends."""
 

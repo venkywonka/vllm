@@ -464,7 +464,7 @@ def select_indexer_impl_cls(
     On Blackwell (SM100) with ``topk_blocks`` in ``(4, 8, 16, 32)`` (matching the
     main MSA attend), the fmha_sm100 score path + Triton top-k is used for both
     bf16 and fp8 index caches. Everything else falls back to the Triton indexer
-    (bf16 only).
+    (bf16 or fp8).
     """
     if indexer_kv_dtype in ("mxfp4", "nvfp4"):
         raise NotImplementedError(
@@ -492,7 +492,7 @@ def select_indexer_impl_cls(
             indexer_kv_dtype,
         )
         return MiniMaxM3IndexerMSAImpl
-    if indexer_kv_dtype != "bf16":
+    if indexer_kv_dtype not in ("bf16", "fp8", "fp8_e4m3"):
         raise NotImplementedError(
             f"indexer_kv_dtype={indexer_kv_dtype!r} is not supported by the "
             "Triton indexer impl."

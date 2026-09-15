@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -52,7 +53,11 @@ logger = init_logger(__name__)
 
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
-NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+NUM_PAR_SOFTMAX_SEGMENTS = 64  # Number of parallel tiled softmax segments
+
+
+def _prefill_reorder_enabled() -> bool:
+    return bool(int(os.environ.get("VLLM_TRITON_ATTN_PREFILL_REORDER", "0")))
 
 
 @dataclass
@@ -93,6 +98,8 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    # Host-side phase decision; the wrapper also applies kernel eligibility.
+    reorder_causal_prefill: bool = False
 
 
 class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMetadata]):
@@ -169,11 +176,14 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             dtype=torch.float32,
             device=device,
         )
+        self.reorder_causal_prefill = _prefill_reorder_enabled()
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
     ) -> TritonAttentionMetadata:
         attn_metadata = self.build(0, common_attn_metadata)
+        # Full graphs freeze the host-side launch choice at capture time.
+        attn_metadata.reorder_causal_prefill = False
         # When doing full graph capture, setting seq_lens to
         # max_model_len will cause graph capture to be extremely
         # slow, so here we set it to 1.
@@ -189,6 +199,18 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         max_query_len = common_attn_metadata.max_query_len
+
+        reorder_causal_prefill = False
+        # Drafting uses fast_build; its cache does not key on request phase.
+        if self.reorder_causal_prefill and not fast_build and max_query_len > 1:
+            is_prefilling = common_attn_metadata.is_prefilling
+            # Speculative verification may have multiple query tokens while
+            # every request is in decode, so query length cannot establish phase.
+            if is_prefilling is not None:
+                assert is_prefilling.device.type == "cpu", (
+                    "CommonAttentionMetadata.is_prefilling must be a CPU tensor"
+                )
+                reorder_causal_prefill = bool(is_prefilling[:num_reqs].any().item())
 
         max_seq_len = common_attn_metadata.max_seq_len
         query_start_loc = common_attn_metadata.query_start_loc
@@ -216,6 +238,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
             max_query_len=max_query_len,
+            reorder_causal_prefill=reorder_causal_prefill,
             query_start_loc=query_start_loc,
             max_seq_len=max_seq_len,
             seq_lens=seq_lens,
@@ -671,6 +694,7 @@ class TritonAttentionImpl(AttentionImpl):
             v_scale_cache=v_scale_cache,
             chunk_lookback=self.chunk_lookback,
             use_td=self.use_td,
+            reorder_causal_prefill=attn_metadata.reorder_causal_prefill,
         )
 
         return output

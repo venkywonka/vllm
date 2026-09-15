@@ -829,6 +829,43 @@ class _RegisteredModel(_BaseRegisteredModel):
         return self.model_cls
 
 
+def _get_model_module_hash(model_path: Path, *, is_package: bool = False) -> str | None:
+    """Hash module bytes or sorted package Python paths and contents."""
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    try:
+        if not model_path.is_file():
+            return None
+        if not is_package and model_path.name != "__init__.py":
+            return safe_hash(model_path.read_bytes(), usedforsecurity=False).hexdigest()
+
+        package_dir = model_path.parent
+        sources = []
+        for directory, _, filenames in os.walk(package_dir, onerror=raise_walk_error):
+            sources.extend(
+                Path(directory) / name for name in filenames if name.endswith(".py")
+            )
+
+        digest = safe_hash(b"vllm-model-package-v1\0", usedforsecurity=False)
+        for source in sorted(sources):
+            relative_path = source.relative_to(package_dir).as_posix().encode("utf-8")
+            content = source.read_bytes()
+            # Length framing distinguishes file boundaries and relative paths.
+            for data in (relative_path, content):
+                digest.update(len(data).to_bytes(8, "big"))
+                digest.update(data)
+        return digest.hexdigest()
+    except Exception:
+        logger.debug(
+            "Cannot hash model source at %s; skipping cache",
+            model_path,
+            exc_info=True,
+        )
+        return None
+
+
 @dataclass(frozen=True)
 class _LazyRegisteredModel(_BaseRegisteredModel):
     """
@@ -900,21 +937,31 @@ class _LazyRegisteredModel(_BaseRegisteredModel):
         # Modules registered with a non-default location (e.g. the
         # hardware-isolated ``vllm.models.<name>`` layout) live outside
         # ``vllm/model_executor/models``. Resolve the module spec directly
-        # so the file-hash cache stays warm for them.
-        if self.module_name.startswith("vllm.model_executor.models."):
-            model_path = Path(__file__).parent / f"{self.module_name.split('.')[-1]}.py"
-        else:
-            try:
-                spec = importlib.util.find_spec(self.module_name)
-            except (ImportError, ValueError):
-                spec = None
-            model_path = Path(spec.origin) if spec is not None and spec.origin else None
+        # and hash package implementations as well as their entry points.
         module_hash = None
+        try:
+            is_package = False
+            if self.module_name.startswith("vllm.model_executor.models."):
+                model_path = (
+                    Path(__file__).parent / f"{self.module_name.split('.')[-1]}.py"
+                )
+            else:
+                spec = importlib.util.find_spec(self.module_name)
+                model_path = (
+                    Path(spec.origin) if spec is not None and spec.origin else None
+                )
+                is_package = bool(spec is not None and spec.submodule_search_locations)
+            if model_path is not None:
+                module_hash = _get_model_module_hash(model_path, is_package=is_package)
+        except Exception:
+            logger.debug(
+                "Cannot hash model source for class %s.%s; skipping cache",
+                self.module_name,
+                self.class_name,
+                exc_info=True,
+            )
 
-        if model_path is not None and model_path.exists():
-            with open(model_path, "rb") as f:
-                module_hash = safe_hash(f.read(), usedforsecurity=False).hexdigest()
-
+        if module_hash is not None:
             mi = self._load_modelinfo_from_cache(module_hash)
             if mi is not None:
                 logger.debug(
