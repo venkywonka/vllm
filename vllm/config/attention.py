@@ -50,7 +50,7 @@ class AttentionConfig:
     except at exact score ties straddling the k-th place (the lower block id
     wins)."""
 
-    minimax_m3_indexer_decode_cp_min_tokens: int = 32
+    minimax_m3_indexer_decode_cp_min_tokens: int = Field(default=32, ge=1)
     """Smallest decode token count (requests x (1 + speculative tokens)) that
     takes the `minimax_m3_indexer_decode_cp` path. Smaller decode batches use
     the default path, where the two extra all-gathers do not pay off."""

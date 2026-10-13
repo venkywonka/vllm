@@ -449,7 +449,7 @@ def get_indexer_decode_cp(
         )
         return None
 
-    min_tokens = max(1, attention_config.minimax_m3_indexer_decode_cp_min_tokens)
+    min_tokens = attention_config.minimax_m3_indexer_decode_cp_min_tokens
     if device is None:
         device = torch.device("cuda", torch.accelerator.current_device_index())
     _STATE = IndexerDecodeCP(
