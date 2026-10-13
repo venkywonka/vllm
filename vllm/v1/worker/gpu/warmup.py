@@ -678,10 +678,7 @@ def warmup_batch_sizes(
 
     Runs after CUDA graph capture, so the first replay of every captured
     graph and the first eager logits GEMM, logits gather and sampler call at
-    every row count happen here rather than on a live request. Kernel
-    selection, lazy module loading and graph upload on that first use can
-    otherwise stall serving for seconds, or stall one TP rank while its peers
-    wait in a collective.
+    every row count happen here rather than on a live request.
     """
     reason = _batch_size_warmup_skip_reason(model_runner)
     if reason is not None:
