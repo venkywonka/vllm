@@ -164,6 +164,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
+    VLLM_MINIMAX_M3_MSA_CUTLASS_MIN_BATCH: int | None = None
     VLLM_DISABLE_COMPILE_CACHE: bool = False
     VLLM_REPLICATE_EMBED: bool = False
     VLLM_USE_LAYERNAME: bool = True
@@ -1465,6 +1466,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_LOG_BATCHSIZE_INTERVAL": lambda: float(
         os.getenv("VLLM_LOG_BATCHSIZE_INTERVAL", "-1")
+    ),
+    # Minimum decode batch for the MiniMax M3 CUTLASS MSA decode path.
+    # Unset selects the measured per-shape default; 16 restores the old gate.
+    "VLLM_MINIMAX_M3_MSA_CUTLASS_MIN_BATCH": lambda: maybe_convert_int(
+        os.getenv("VLLM_MINIMAX_M3_MSA_CUTLASS_MIN_BATCH")
     ),
     "VLLM_DISABLE_COMPILE_CACHE": disable_compile_cache,
     # If set to "0", disable LayerName opaque type for layer_name
