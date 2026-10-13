@@ -26,6 +26,7 @@ AMD / non-SM100.
 """
 
 import math
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import ClassVar
@@ -312,7 +313,14 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 self.num_index_heads, _compute_pack_factor
             ):
                 get_fmha_variant(dtype_code, *variant)
-        except (ImportError, KeyError, OSError, RuntimeError, ValueError) as e:
+        except (
+            ImportError,
+            KeyError,
+            OSError,
+            RuntimeError,
+            ValueError,
+            subprocess.CalledProcessError,  # `ninja -t deps` in the JIT cache
+        ) as e:
             logger.warning(
                 "MiniMax-M3 indexer prefill split-KV disabled: preparing the "
                 "fmha_sm100 score variants failed (%s).",
