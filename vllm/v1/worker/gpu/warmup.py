@@ -626,6 +626,9 @@ class _BatchSizeWarmupBuilder:
             if self.num_spec_steps > 0:
                 out.scheduled_spec_decode_tokens[req_id] = [0] * self.num_spec_steps
         out.scheduled_cached_reqs = cached
+        # The runner proposes this many drafts for the next step (dynamic K);
+        # without it the drafter decode graphs are never replayed.
+        out.num_spec_tokens_to_schedule = self.num_spec_steps
 
         for prompt_len in prefill_lens:
             req_id = f"_batch_size_warmup_{self.num_new_reqs}_"

@@ -83,8 +83,11 @@ class _Recorder:
         self.computed: dict[str, int] = {}
         # (decode requests, new requests, total scheduled tokens) per step
         self.steps: list[tuple[int, int, int]] = []
+        self.num_spec_tokens: set[int] = set()
 
     def execute_model(self, out) -> None:
+        if out.num_scheduled_tokens:
+            self.num_spec_tokens.add(out.num_spec_tokens_to_schedule)
         for req_id in out.finished_req_ids:
             del self.blocks[req_id], self.computed[req_id]
         for new_req in out.scheduled_new_reqs:
@@ -175,6 +178,8 @@ def test_warmup_batch_sizes_runs_plan_with_valid_blocks(num_spec_steps, monkeypa
     single_prefills = {t for d, n, t in recorder.steps if d == 0 and n == 1}
     assert {t for t in capture_sizes if t != q} <= single_prefills
     assert not recorder.blocks, "every warmup request is finished"
+    # Every step asks the runner for K drafts, so drafter graphs replay.
+    assert recorder.num_spec_tokens == {num_spec_steps}
 
 
 def test_warmup_batch_sizes_skips_when_kv_cache_is_too_small(monkeypatch):
