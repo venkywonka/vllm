@@ -12,6 +12,7 @@ import torch
 from vllm.config.attention import MiniMaxM3MSADecodeBackend
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import get_kv_quant_mode
 
 _MAX_NUM_Q_HEADS = 64
@@ -23,10 +24,13 @@ _TOPK = 16
 # fixed planner allocation used by the MSA decode kernel.
 _MAX_QUERY_HEAD_ROWS = 65536
 _MAX_DECODE_QUERY_LEN = 32
+# GB300 (SM103) kernel benchmarks put the CUTLASS crossover at 1024 query-head
+# rows for query lengths 1-8; other shapes keep the batch-16 floor. NVFP4 has
+# no Triton fallback, so it takes CUTLASS at every batch size.
 _DEFAULT_MIN_CUTLASS_BATCH_SIZE = 16
-_B300_EAGLE3_QUERY_HEAD_ROWS = 1024
-_B300_EAGLE3_MAX_QUERY_LEN = 8
-_B300_EAGLE3_HEAD_GEOMETRIES = {(64, 4), (32, 2), (16, 1)}
+_SM103_MIN_QUERY_HEAD_ROWS = 1024
+_SM103_MAX_TUNED_QUERY_LEN = 8
+_SM103_TUNED_HEAD_GEOMETRIES = {(64, 4), (32, 2), (16, 1)}
 
 
 def is_nvfp4_kv_cache(kv_cache_dtype: str) -> bool:
@@ -243,12 +247,11 @@ def _min_cutlass_batch_size(
 ) -> int:
     if (
         not current_platform.is_device_capability((10, 3))
-        or not 1 <= decode_query_len <= _B300_EAGLE3_MAX_QUERY_LEN
-        or (num_q_heads, num_kv_heads) not in _B300_EAGLE3_HEAD_GEOMETRIES
+        or not 1 <= decode_query_len <= _SM103_MAX_TUNED_QUERY_LEN
+        or (num_q_heads, num_kv_heads) not in _SM103_TUNED_HEAD_GEOMETRIES
     ):
         return _DEFAULT_MIN_CUTLASS_BATCH_SIZE
-    query_head_rows = decode_query_len * num_q_heads
-    return (_B300_EAGLE3_QUERY_HEAD_ROWS + query_head_rows - 1) // query_head_rows
+    return cdiv(_SM103_MIN_QUERY_HEAD_ROWS, decode_query_len * num_q_heads)
 
 
 def supports_cutlass_sparse_decode(
