@@ -183,14 +183,11 @@ def _merge_topk_kernel(
     tl.store(out, blk)
 
 
-def _is_pow2(n: int) -> bool:
-    return n > 0 and n & (n - 1) == 0
-
-
 def _local_groups(width: int) -> tuple[int, int] | None:
     """(groups, tiles per group) covering a compact row of ``width``, or None."""
     num_groups = min(NUM_GROUPS, width)
-    if not (_is_pow2(width) and num_groups >= TOPK):
+    is_pow2 = width > 0 and width & (width - 1) == 0
+    if not (is_pow2 and num_groups >= TOPK):
         return None
     return num_groups, width // num_groups
 
