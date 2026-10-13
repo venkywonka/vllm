@@ -2176,7 +2176,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS": lambda: int(
         os.getenv("VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS", "0")
     ),
-    # Prefer contiguous physical block-ID runs for large KV-cache allocations.
+    # If set to 1, the scheduler's GPU KV-cache pool prefers contiguous physical
+    # block-ID runs for allocations of 8+ blocks, so disaggregated (e.g. NIXL)
+    # KV transfers can coalesce descriptors. Set it on both P and D instances.
     "VLLM_KV_CONTIG_ALLOC": lambda: bool(int(os.getenv("VLLM_KV_CONTIG_ALLOC", "0"))),
     # On WSL2 with a compatible kernel (>= 4.19.121), pinned memory is
     # supported but disabled by default due to a small performance regression.

@@ -122,6 +122,11 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
     - Set when prefiller and decoder are on different machines
     - Connection info is passed via KVTransferParams from prefiller to decoder for handshake
 
+- `VLLM_KV_CONTIG_ALLOC`: Prefer contiguous physical KV block IDs for large allocations (Optional)
+    - Default: 0
+    - Set to 1 on both prefiller and decoder instances, so that both the local and the remote block IDs of a transfer can form adjacent runs that NIXL can coalesce into fewer descriptors
+    - Applies only to the scheduler's GPU KV-cache pool, for allocations of 8 or more blocks. It can reorder LRU eviction inside a bounded window, and the benefit is workload-dependent
+
 - `kv_lease_duration` (via `kv_connector_extra_config`): Lease duration (in seconds) for the prefiller's KV cache blocks. (Optional)
     - Default: 30
     - When a prefill request finishes, its KV blocks are held for this duration waiting for the decoder to read them. While the request is queued on the decoder, periodic heartbeats automatically extend the lease. If neither a heartbeat nor a read notification arrives before the lease expires, the blocks are freed. The heartbeat interval and extension amount are derived automatically from this value.
