@@ -12,13 +12,19 @@ import numpy as np
 import pytest
 import torch
 
-from vllm.models.minimax_m3.nvidia.indexer_msa import (
+from vllm.platforms import current_platform
+
+# indexer_msa imports the CuteDSL decode op (cutlass, quack), which only CUDA
+# images install. Skip the module elsewhere (e.g. ROCm) instead of failing
+# collection of the whole attention test directory.
+pytest.importorskip("cutlass")
+
+from vllm.models.minimax_m3.nvidia.indexer_msa import (  # noqa: E402
     PAGE_SIZE,
     _host_prefill_kv_lens,
     _plan_prefill_segments,
     _segment_page_index,
 )
-from vllm.platforms import current_platform
 
 NUM_SMS = 148
 
