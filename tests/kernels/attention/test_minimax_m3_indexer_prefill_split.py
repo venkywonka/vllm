@@ -143,6 +143,8 @@ def test_host_prefill_kv_lens_dcp_verify_row():
     ],
 )
 def test_split_prefill_score_bitwise(qo, kv, heads, index_dtype):
+    """Score-only output has no cross-split combine, so equality across the
+    unsplit and split variants is exact; an fmha_sm100 pin bump must keep it."""
     from vllm.third_party.fmha_sm100.api import _fmha_sm100, _fmha_sm100_plan
 
     torch.manual_seed(0)
