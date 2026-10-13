@@ -51,6 +51,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     CommonAttentionMetadata,
+    max_decode_query_len,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -285,6 +286,10 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         )
         self.prefill_max_kv_splits = 1
         self.num_sms = 0
+        # Widest spec-verify query. Host prefill lengths are trusted only on
+        # rows wider than this: reorder_batch_threshold drops to 1 under DCP,
+        # where a verify row can land on the prefill side.
+        self.host_lens_max_decode_query_len = max_decode_query_len(vllm_config)
         if vllm_config.attention_config.minimax_m3_indexer_prefill_kv_split:
             self._init_prefill_kv_split(kv_cache_spec, device)
 
@@ -342,7 +347,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             side_qo,
             lo,
             hi,
-            self.reorder_batch_threshold,
+            max(self.reorder_batch_threshold, self.host_lens_max_decode_query_len),
         )
         if side_kv is None:
             side_kv = common_attn_metadata.seq_lens[lo:hi].cpu().to(torch.int32)

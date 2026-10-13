@@ -117,6 +117,17 @@ def test_host_prefill_kv_lens():
     assert _host_prefill_kv_lens(upper, torch.tensor([300, 9001]), 2, 4, 4) is None
 
 
+def test_host_prefill_kv_lens_dcp_verify_row():
+    # Under DCP the reorder threshold is 1, so a spec-verify row (q = 1 + K)
+    # lands on the prefill side with an optimistic upper bound. The builder
+    # passes max(reorder_batch_threshold, max_decode_query_len) = 1 + K, which
+    # must reject that row; the raw threshold of 1 would accept it.
+    upper = torch.tensor([4000, 9000], dtype=torch.int32)
+    verify_row = torch.tensor([300, 4], dtype=torch.int32)  # K = 3
+    assert _host_prefill_kv_lens(upper, verify_row, 0, 2, decode_threshold=4) is None
+    assert _host_prefill_kv_lens(upper, verify_row, 0, 2, decode_threshold=1) is not None
+
+
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(100),
     reason="fmha_sm100 indexer requires SM100 (Blackwell).",
