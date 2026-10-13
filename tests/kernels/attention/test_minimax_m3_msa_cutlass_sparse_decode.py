@@ -71,6 +71,7 @@ SM_SCALE = HEAD_DIM**-0.5
     [
         pytest.param(15, 1, 64, 4, True, False, id="qlen1-below-row-floor"),
         pytest.param(16, 1, 64, 4, True, True, id="qlen1-at-row-floor"),
+        pytest.param(16, 1, 16, 1, True, False, id="qlen1-tp4-raised-floor"),
         pytest.param(10, 3, 32, 2, True, False, id="qlen3-below-row-floor"),
         pytest.param(11, 3, 32, 2, True, True, id="qlen3-at-row-floor"),
         pytest.param(3, 4, 64, 4, True, False, id="qlen4-below-row-floor"),
@@ -497,7 +498,7 @@ def _make_topk(
         pytest.param(64, 4, 8, 8, False, id="tp1-query-len-8"),
         pytest.param(16, 1, 8, 1, True, id="tp4-query-len-1"),
         pytest.param(16, 1, 16, 4, True, id="tp4-query-len-4"),
-        # Measured B300 EAGLE3 dispatch boundaries.
+        # Measured SM103 dispatch boundaries.
         pytest.param(64, 4, 2, 4, True, id="tp1-batch-4-query-len-4"),
         pytest.param(32, 2, 4, 4, True, id="tp2-batch-8-query-len-4"),
         pytest.param(16, 1, 8, 4, True, id="tp4-batch-16-query-len-4"),
