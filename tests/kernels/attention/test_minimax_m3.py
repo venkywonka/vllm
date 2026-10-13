@@ -939,12 +939,14 @@ def test_msa_indexer_impl_matches_triton(
         (num_tokens, num_idx_heads, topk), -2, dtype=torch.int32, device=device
     )
 
+    msa_md = msa_builder.build(0, common)
     attn_metadata = {
-        msa_impl.index_cache.prefix: msa_builder.build(0, common),
+        msa_impl.index_cache.prefix: msa_md,
         triton_impl.index_cache.prefix: triton_builder.build(0, common),
     }
     # The prefill side (2 requests, ~2.7k context, 4 heads) splits when enabled.
-    msa_prefill_plan = attn_metadata[msa_impl.index_cache.prefix].prefill_msa.plan
+    assert msa_md.prefill_msa is not None
+    msa_prefill_plan = msa_md.prefill_msa.plan
     assert (msa_prefill_plan["num_kv_splits"] > 1) == prefill_kv_split
     with set_forward_context(attn_metadata, vllm_config):
         msa_decode, msa_prefill = msa_impl(index_q)
