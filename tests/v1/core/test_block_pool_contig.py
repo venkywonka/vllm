@@ -4,6 +4,7 @@
 import pytest
 
 from vllm.v1.core.block_pool import BlockPool
+from vllm.v1.core.kv_cache_utils import BlockHash, make_block_hash_with_group_id
 
 pytestmark = pytest.mark.cpu_test
 
@@ -134,9 +135,25 @@ def test_contiguous_alloc_search_is_bounded():
     assert [block.block_id for block in blocks] == list(range(1, 16, 2))
 
 
-def test_contiguous_alloc_enabled_from_environment(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("VLLM_KV_CONTIG_ALLOC", "1")
+def test_contiguous_alloc_evicts_cached_run_in_window():
+    """The window can select and evict a cached run behind uncached blocks."""
+    pool = BlockPool(num_gpu_blocks=17, enable_caching=True, hash_block_size=16)
+    blocks_by_id = {block.block_id: block for block in pool.get_new_blocks(16)}
+    for block_id in range(9, 17):
+        block_hash = make_block_hash_with_group_id(BlockHash(bytes([block_id])), 0)
+        blocks_by_id[block_id].set_block_hash(block_hash)
+        pool.cached_block_hash_to_block.insert(block_hash, blocks_by_id[block_id])
+    uncached_order = [2, 4, 6, 8, 1, 3, 5, 7]
+    pool.free_blocks(
+        [blocks_by_id[block_id] for block_id in [*uncached_order, *range(9, 17)]]
+    )
+    pool.use_contiguous_allocation = True
 
-    pool = make_pool_with_free_order([12, 4, 5, 6, 7, 8, 9, 10, 11, 3, 2, 1])
+    blocks = pool.get_new_blocks(8)
 
-    assert pool.use_contiguous_allocation
+    assert [block.block_id for block in blocks] == list(range(9, 17))
+    assert all(block.block_hash is None for block in blocks)
+    assert len(pool.cached_block_hash_to_block) == 0
+    assert [
+        block.block_id for block in pool.free_block_queue.get_all_free_blocks()
+    ] == uncached_order
