@@ -265,7 +265,7 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         # Opt-in decode context parallelism across the TP ranks
-        # (VLLM_MINIMAX_M3_INDEXER_DECODE_CP=1, see indexer_decode_cp.py);
+        # (attention_config.minimax_m3_indexer_decode_cp, see indexer_decode_cp.py);
         # None keeps the default decode path.
         self.decode_cp = get_indexer_decode_cp(
             num_local_heads=self.num_index_heads, max_k_tiles=MAX_K_TILES

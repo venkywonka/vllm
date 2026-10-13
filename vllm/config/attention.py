@@ -43,6 +43,18 @@ class AttentionConfig:
     minimax_m3_msa_decode_backend: MiniMaxM3MSADecodeBackend = "triton"
     """Sparse decode kernel used by the MiniMax M3 MSA backend."""
 
+    minimax_m3_indexer_decode_cp: bool = False
+    """MiniMax M3 MSA (SM100) indexer, decode-only batches at TP 4 or 8: split
+    the index-K blocks across the TP ranks instead of scoring the full context
+    on every rank, then merge an exact top-k. Same selection as the default
+    path except at exact score ties straddling the k-th place (the lower block
+    id wins)."""
+
+    minimax_m3_indexer_decode_cp_min_tokens: int = 32
+    """Smallest decode token count (requests x (1 + speculative tokens)) that
+    takes the `minimax_m3_indexer_decode_cp` path. Smaller decode batches use
+    the default path, where the two extra all-gathers do not pay off."""
+
     backend_per_kind: dict[str, AttentionBackendEnum] = field(default_factory=dict)
     """Per-KV-cache-group attention backend overrides, keyed by
     `KVCacheSpecKind` (e.g. `{"mla_attention": "FLASHINFER_MLA",

@@ -9,7 +9,7 @@ rank stores the full index-K cache. Each rank scores its own index head(s)
 top-16 blocks. At TP4 every rank therefore reads all of the index-K once per
 sparse layer per decode step, and that read grows with the context.
 
-With ``VLLM_MINIMAX_M3_INDEXER_DECODE_CP=1`` the context is split across the
+With ``attention_config.minimax_m3_indexer_decode_cp`` the context is split across the
 TP group instead of the heads. Per sparse layer, for decode-only batches:
 
 1. all-gather the index queries, so every rank holds all index heads;
@@ -42,7 +42,6 @@ shared by all layers; there is no host sync.
 
 import torch
 
-import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -427,11 +426,12 @@ def get_indexer_decode_cp(
     if _RESOLVED:
         return _STATE
     _RESOLVED = True
-    if not envs.VLLM_MINIMAX_M3_INDEXER_DECODE_CP:
+    vllm_config = get_current_vllm_config()
+    attention_config = vllm_config.attention_config
+    if not attention_config.minimax_m3_indexer_decode_cp:
         return None
 
     cp = get_tensor_model_parallel_world_size()
-    vllm_config = get_current_vllm_config()
     hf_config = vllm_config.model_config.hf_config
     text_config = getattr(hf_config, "text_config", hf_config)
     sparse_cfg = text_config.sparse_attention_config
@@ -464,13 +464,13 @@ def get_indexer_decode_cp(
         why = f"{num_heads} index heads x query len {max_query_len} > 32"
     if why is not None:
         logger.warning(
-            "VLLM_MINIMAX_M3_INDEXER_DECODE_CP=1 ignored: %s; using the default "
+            "minimax_m3_indexer_decode_cp ignored: %s; using the default "
             "indexer decode path.",
             why,
         )
         return None
 
-    min_tokens = max(1, envs.VLLM_MINIMAX_M3_INDEXER_DECODE_CP_MIN_TOKENS)
+    min_tokens = max(1, attention_config.minimax_m3_indexer_decode_cp_min_tokens)
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
     _STATE = IndexerDecodeCP(
