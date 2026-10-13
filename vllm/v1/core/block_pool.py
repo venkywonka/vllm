@@ -3,7 +3,6 @@
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
-from vllm import envs
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
     AllBlocksCleared,
@@ -172,7 +171,7 @@ class BlockPool:
         self.medium = medium
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
-        self.use_contiguous_allocation = envs.VLLM_KV_CONTIG_ALLOC
+        self.use_contiguous_allocation = False
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
@@ -738,6 +737,13 @@ class BlockPool:
         self.free_block_queue.append_n(released)
 
     def _get_contiguous_free_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
+        """Pop ``num_blocks`` free blocks, preferring physical block-ID runs.
+
+        Scans the first ``_CONTIGUOUS_ALLOC_WINDOW_FACTOR * num_blocks`` queue
+        entries, takes the longest queue-adjacent ID runs (normalized to
+        ascending order), then fills the rest from the queue head. Blocks
+        released by ``unpin_blocks`` never join a run, so they stay last-resort.
+        """
         window_size = min(
             self.get_num_free_blocks(),
             _CONTIGUOUS_ALLOC_WINDOW_FACTOR * num_blocks,
