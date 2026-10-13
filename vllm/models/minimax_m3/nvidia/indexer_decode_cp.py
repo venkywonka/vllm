@@ -1,43 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Context-parallel MSA indexer decode for MiniMax-M3 (opt-in).
+"""Opt-in context-parallel MSA indexer decode for MiniMax-M3.
 
-Default decode (``indexer_msa.py``): MiniMax-M3 has 4 index-query heads and one
-index-K head. The index-K projection is replicated on every TP rank, so every
-rank stores the full index-K cache. Each rank scores its own index head(s)
-(sharded like the KV heads) over the whole context, then picks that head's
-top-16 blocks. At TP4 every rank therefore reads all of the index-K once per
-sparse layer per decode step, and that read grows with the context.
-
-With ``attention_config.minimax_m3_indexer_decode_cp`` the context is split across the
-TP group instead of the heads. Per sparse layer, for decode-only batches:
+Enabled by ``attention_config.minimax_m3_indexer_decode_cp``. For decode-only
+batches, the TP ranks split the index-K blocks instead of each rank scoring its
+own index head(s) over the whole context. Per sparse layer:
 
 1. all-gather the index queries, so every rank holds all index heads;
-2. score: rank ``r`` scores only blocks ``j * tp + r`` for all heads
-   (``index_decode_score.py``, ``cp_size``/``cp_rank``) into a compact
-   ``[T, H, max_k_tiles / tp]`` buffer, so it reads ``1/tp`` of the index-K;
-3. local top-16 per (token, head) over those blocks, as packed int64 keys;
+2. rank ``r`` scores blocks ``j * tp + r`` for all heads into a compact
+   ``[T, H, max_k_tiles / tp]`` buffer (``index_decode_score.py``);
+3. local top-16 per (token, head) as packed int64 keys;
 4. all-gather the candidates (``16 * tp`` per (token, head));
-5. each rank merges the candidates of its own head(s) into the top-16 block
-   ids, ascending and ``-1`` padded: the ``sparse_topk_select`` output
-   contract, written into the shared ``topk_indices_buffer``.
+5. each rank merges its own heads' candidates into the ``sparse_topk_select``
+   output contract (ascending block ids, ``-1`` padded) in the shared
+   ``topk_indices_buffer``.
 
-Exactness: the scores are bitwise the default ones (same kernel, same MMA
-order, same block). Keys order by (score desc, block id asc); forced blocks
-(``sparse_init_block`` / ``sparse_local_block``) get score FLT_MAX, as in
-``sparse_topk_select``. Under a total order the top-16 of a union is the top-16
-of the per-part top-16s, so the merge is the exact top-16. That equals the
-default selection whenever no equal scores straddle the 16th place. On such
-exact fp32 ties the default ``sparse_topk_select`` picks in an order that is
-not specified; here the lower block id wins, deterministically.
-
-Collectives: both all-gathers move raw bytes viewed as fp32 through
-``sp_all_gather`` (the one-shot custom all-gather when available, else NCCL)
-on the forward stream. Every rank takes the same branch: the gate depends only
-on the env, the parallel layout and the batch's decode/prefill token counts.
-
-CUDA graphs: fixed shapes per decode size; the buffers are persistent and
-shared by all layers; there is no host sync.
+The scores are bitwise the default ones. Keys order by (score desc, block id
+asc) and forced init/local blocks get FLT_MAX, so the merge is the exact
+top-16. It equals ``sparse_topk_select`` except at exact fp32 ties that
+straddle the 16th place, where the lower block id wins.
 """
 
 import torch
