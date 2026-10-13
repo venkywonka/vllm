@@ -44,11 +44,11 @@ class AttentionConfig:
     """Sparse decode kernel used by the MiniMax M3 MSA backend."""
 
     minimax_m3_indexer_decode_cp: bool = False
-    """MiniMax M3 MSA (SM100) indexer, decode-only batches at TP 4 or 8: split
-    the index-K blocks across the TP ranks instead of scoring the full context
-    on every rank, then merge an exact top-k. Same selection as the default
-    path except at exact score ties straddling the k-th place (the lower block
-    id wins)."""
+    """MiniMax M3 MSA (SM100) indexer, decode-only batches at TP 4: split the
+    index-K blocks across the TP ranks instead of scoring the full context on
+    every rank, then merge an exact top-k. Same selection as the default path
+    except at exact score ties straddling the k-th place (the lower block id
+    wins)."""
 
     minimax_m3_indexer_decode_cp_min_tokens: int = 32
     """Smallest decode token count (requests x (1 + speculative tokens)) that

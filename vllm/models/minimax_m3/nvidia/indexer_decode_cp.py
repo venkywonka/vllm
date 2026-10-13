@@ -55,9 +55,10 @@ from vllm.triton_utils import tl, triton
 logger = init_logger(__name__)
 
 TOPK = 16
-# TP sizes served. Each rank's compact row (max_k_tiles / tp tiles) is split
-# into NUM_GROUPS power-of-two groups for the two-level local top-k.
-SUPPORTED_TP_SIZES = (4, 8)
+# TP sizes served; only TP4 is validated end to end so far. Each rank's
+# compact row (max_k_tiles / tp tiles) is split into NUM_GROUPS power-of-two
+# groups for the two-level local top-k.
+SUPPORTED_TP_SIZES = (4,)
 NUM_GROUPS = 128
 LOCAL_NUM_WARPS = 4
 MERGE_NUM_WARPS = 1
