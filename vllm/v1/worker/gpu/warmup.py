@@ -605,7 +605,6 @@ class _BatchSizeWarmupBuilder:
         out = SchedulerOutput.make_empty()
         out.finished_req_ids = self._finish(self.finishing + self.pool[num_decode:])
         self.finishing, self.pool = [], self.pool[:num_decode]
-        out.num_common_prefix_blocks = [0] * len(self.specs)
 
         cached = CachedRequestData.make_empty()
         for req_id in self.pool:
