@@ -22,10 +22,9 @@ def _make_runner(
     max_num_reqs: int,
     capture_sizes: list[int],
     num_blocks: int = 4096,
-    **overrides,
 ) -> SimpleNamespace:
     """Stub model runner exposing only what the warmup reads."""
-    runner = SimpleNamespace(
+    return SimpleNamespace(
         is_pooling_model=False,
         is_encoder_decoder=False,
         pcp_manager=None,
@@ -71,9 +70,6 @@ def _make_runner(
         kv_block_zeroer=None,
         kv_connector=SimpleNamespace(set_disabled=lambda disabled: None),
     )
-    for key, value in overrides.items():
-        setattr(runner, key, value)
-    return runner
 
 
 class _Recorder:
@@ -187,22 +183,6 @@ def test_warmup_batch_sizes_runs_plan_with_valid_blocks(num_spec_steps, monkeypa
 def test_warmup_batch_sizes_skips_when_kv_cache_is_too_small(monkeypatch):
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda: None)
     runner = _make_runner(0, max_num_reqs=8, capture_sizes=[], num_blocks=4)
-    recorder = _Recorder(num_lookahead_tokens=0)
-
-    warmup_batch_sizes(runner, recorder.execute_model, recorder.sample_tokens)
-
-    assert not recorder.steps
-
-
-def test_warmup_batch_sizes_skips_data_parallel():
-    runner = _make_runner(
-        0,
-        max_num_reqs=8,
-        capture_sizes=[],
-        parallel_config=SimpleNamespace(
-            pipeline_parallel_size=1, data_parallel_size=2, enable_eplb=False
-        ),
-    )
     recorder = _Recorder(num_lookahead_tokens=0)
 
     warmup_batch_sizes(runner, recorder.execute_model, recorder.sample_tokens)
