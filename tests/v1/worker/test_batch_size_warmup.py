@@ -36,7 +36,9 @@ def _make_runner(
         max_num_reqs=max_num_reqs,
         max_num_tokens=2048,
         max_model_len=MAX_MODEL_LEN,
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, data_parallel_size=1, enable_eplb=False
+        ),
         scheduler_config=SimpleNamespace(
             max_num_batched_tokens=2048, max_num_scheduled_tokens=None
         ),
@@ -197,7 +199,9 @@ def test_warmup_batch_sizes_skips_data_parallel():
         0,
         max_num_reqs=8,
         capture_sizes=[],
-        parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=2),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, data_parallel_size=2, enable_eplb=False
+        ),
     )
     recorder = _Recorder(num_lookahead_tokens=0)
 

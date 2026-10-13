@@ -528,6 +528,9 @@ def _batch_size_warmup_skip_reason(model_runner: GPUModelRunner) -> str | None:
         return "data parallel"
     if model_runner.pcp_manager is not None:
         return "prefill context parallel"
+    if parallel_config.enable_eplb:
+        # Every step would advance EPLB and record synthetic expert load.
+        return "EPLB"
     if model_runner.adaptive_verification is not None:
         return "adaptive verification"
     if model_runner.num_speculative_steps > 0 and model_runner.speculator is None:
